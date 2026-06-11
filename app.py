@@ -14,6 +14,16 @@ from streamlit_mic_recorder import mic_recorder
 from groq import Groq
 
 # =========================================================
+# PAGE CONFIG — must be the VERY FIRST Streamlit command
+# =========================================================
+st.set_page_config(
+    page_title="VigilantAP | Food Safety Intelligence",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# =========================================================
 # LOAD GROQ API KEY FROM note.env
 # =========================================================
 
@@ -35,6 +45,634 @@ def load_api_key_from_file(filepath: str) -> str:
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE     = os.path.join(BASE_DIR, "note.env")
 GROQ_API_KEY = load_api_key_from_file(ENV_FILE) or os.getenv("GROQ_API_KEY", "")
+# =========================================================
+# AUTH / SUBSCRIPTION / ADMIN SYSTEM
+# =========================================================
+
+# ---- Default users (seeded once into session_state so signups persist across reruns) ----
+# Roles:
+#   'admin' — Platform creator (Social Tek). No billing. Sees Admin + Revenue tabs.
+#   'org'   — Organisation/Enterprise subscriber (₹9,999/mo). Full AI access.
+#   'user'  — Individual subscriber (₹2,999/mo) or free. AI gated by subscribed flag.
+_DEFAULT_USERS = {
+    'admin': {
+        'password': 'admin123',
+        'role': 'admin',
+        'name': 'Social Tek Admin',
+        'email': 'admin@vigilantap.in',
+        'subscribed': True,   # admin always has full access
+        'plan': 'Admin',      # special plan — never billed
+        'joined': '2024-01-01',
+    },
+    'apfooddept': {
+        'password': 'org2024',
+        'role': 'org',
+        'name': 'AP Food Safety Dept',
+        'email': 'contact@apfood.gov.in',
+        'subscribed': True,
+        'plan': 'Enterprise',
+        'joined': '2024-02-01',
+    },
+    'inspector1': {
+        'password': 'pass123',
+        'role': 'user',
+        'name': 'Ravi Kumar',
+        'email': 'ravi@apfood.in',
+        'subscribed': True,
+        'plan': 'Pro',
+        'joined': '2024-03-15',
+    },
+    'viewer1': {
+        'password': 'view123',
+        'role': 'user',
+        'name': 'Priya Sharma',
+        'email': 'priya@apfood.in',
+        'subscribed': False,
+        'plan': 'Free',
+        'joined': '2025-01-10',
+    },
+    'officer1': {
+        'password': 'off123',
+        'role': 'user',
+        'name': 'Srinivas Rao',
+        'email': 'srinivas@apgov.in',
+        'subscribed': True,
+        'plan': 'Pro',
+        'joined': '2024-06-20',
+    },
+}
+
+# Seed into session_state ONCE — all signup writes also go here, so reruns never lose new accounts
+if 'USERS_DB' not in st.session_state:
+    st.session_state.USERS_DB = dict(_DEFAULT_USERS)
+
+# Convenience alias — always read/write through this
+USERS_DB = st.session_state.USERS_DB
+
+# ---- Subscription plans (Admin plan is internal — not billed) ----
+PLANS = {
+    'Free':       {'price': 0,    'color': '#64748B', 'icon': '🔓'},
+    'Trial':      {'price': 0,    'color': '#059669', 'icon': '🎯'},
+    'Pro':        {'price': 2999, 'color': '#2563EB', 'icon': '⚡'},
+    'Enterprise': {'price': 9999, 'color': '#7C3AED', 'icon': '🏆'},
+    'Admin':      {'price': 0,    'color': '#7C3AED', 'icon': '👑'},
+}
+
+# ---- Auth session state ----
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in    = False
+if 'current_user' not in st.session_state:
+    st.session_state.current_user = None
+if 'login_error' not in st.session_state:
+    st.session_state.login_error  = ''
+if 'plan_selected' not in st.session_state:
+    st.session_state.plan_selected = False
+if 'pending_payment_plan' not in st.session_state:
+    st.session_state.pending_payment_plan = None
+if 'show_payment_page' not in st.session_state:
+    st.session_state.show_payment_page = False
+if 'trial_start' not in st.session_state:
+    st.session_state.trial_start = {}   # {username: datetime}
+if 'pro_filters_applied' not in st.session_state:
+    st.session_state.pro_filters_applied = False
+# Per-tab filter state for Pro plan inline filters
+if 'pro_tab_filters' not in st.session_state:
+    st.session_state.pro_tab_filters = {}
+
+def do_login(username, password):
+    # Always read from session_state so newly signed-up users are found
+    db = st.session_state.USERS_DB
+    u  = db.get(username)
+    if u and u['password'] == password:
+        st.session_state.logged_in    = True
+        st.session_state.current_user = username
+        st.session_state.login_error  = ''
+        # Admin and org skip plan selection; everyone else must pick a plan first
+        if u.get('role') in ('admin', 'org') or u.get('plan') in ('Pro', 'Enterprise', 'Trial'):
+            st.session_state.plan_selected = True
+        else:
+            st.session_state.plan_selected = False
+        st.session_state.show_payment_page = False
+        st.session_state.pending_payment_plan = None
+        return True
+    st.session_state.login_error = '❌ Invalid username or password.'
+    return False
+
+def do_logout():
+    st.session_state.logged_in    = False
+    st.session_state.current_user = None
+    st.session_state.welcome_screen_seen = False
+    st.session_state.plan_selected = False
+    st.session_state.show_payment_page = False
+    st.session_state.pending_payment_plan = None
+
+def current_user_info():
+    return st.session_state.USERS_DB.get(st.session_state.current_user, {})
+
+def is_admin():
+    return current_user_info().get('role') == 'admin'
+
+def is_org():
+    return current_user_info().get('role') == 'org'
+
+def is_subscribed():
+    # Admin and org always have full access; users need subscribed=True
+    role = current_user_info().get('role', 'user')
+    if role in ('admin', 'org'):
+        return True
+    return current_user_info().get('subscribed', False)
+
+def can_see_admin_panel():
+    """Only the platform admin (Social Tek) sees Admin + Revenue tabs."""
+    return is_admin()
+
+def is_trial_active():
+    """Returns True if user is on trial and within 24 hours."""
+    uname = st.session_state.current_user
+    if not uname:
+        return False
+    ui = current_user_info()
+    if ui.get('plan') != 'Trial':
+        return False
+    trial_starts = st.session_state.get('trial_start', {})
+    if uname not in trial_starts:
+        return False
+    elapsed = (datetime.now() - trial_starts[uname]).total_seconds()
+    return elapsed < 86400   # 24 hours
+
+def trial_time_remaining():
+    """Returns seconds remaining in trial, or 0."""
+    uname = st.session_state.current_user
+    trial_starts = st.session_state.get('trial_start', {})
+    if uname not in trial_starts:
+        return 0
+    elapsed = (datetime.now() - trial_starts[uname]).total_seconds()
+    return max(0, 86400 - elapsed)
+
+def is_trial_expired():
+    """Returns True if user had a trial but it's expired."""
+    uname = st.session_state.current_user
+    if not uname:
+        return False
+    ui = current_user_info()
+    if ui.get('plan') != 'Trial':
+        return False
+    trial_starts = st.session_state.get('trial_start', {})
+    if uname not in trial_starts:
+        return False
+    elapsed = (datetime.now() - trial_starts[uname]).total_seconds()
+    return elapsed >= 86400
+
+def is_pro_plan():
+    """Returns True if the current user is on the Pro plan (not Enterprise/Admin/Org)."""
+    role = current_user_info().get('role', 'user')
+    if role in ('admin', 'org'):
+        return False
+    return current_user_info().get('plan') == 'Pro'
+
+def can_see_ai():
+    """Subscribed users, trial users, org, and admin can access AI features."""
+    role = current_user_info().get('role', 'user')
+    if role in ('admin', 'org'):
+        return True
+    if current_user_info().get('plan') == 'Trial' and is_trial_active():
+        return True
+    return current_user_info().get('subscribed', False) and current_user_info().get('plan') in ('Pro', 'Enterprise')
+
+# ---- AUTH SESSION STATE EXTRAS ----
+if 'auth_tab' not in st.session_state:
+    st.session_state.auth_tab = 'signin'
+if 'signup_error' not in st.session_state:
+    st.session_state.signup_error = ''
+if 'signup_success' not in st.session_state:
+    st.session_state.signup_success = ''
+
+# ---- LOGIN / SIGNUP PAGE ----
+if not st.session_state.logged_in:
+    st.markdown('''
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800;900&family=DM+Sans:wght@400;500;600&display=swap');
+    .stApp { background: linear-gradient(135deg,#0A0F1E 0%,#0F172A 50%,#0A0F1E 100%) !important; }
+    header,footer,#MainMenu { visibility:hidden !important; }
+    header[data-testid="stHeader"],div[data-testid="stDecoration"],.stAppHeader {
+        display:none !important; height:0 !important;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        background: rgba(255,255,255,0.06) !important;
+        border-radius: 12px !important; padding: 4px !important;
+        border: 1px solid rgba(255,255,255,0.08) !important;
+    }
+    .stTabs [data-baseweb="tab"] {
+        color: #94A3B8 !important; border-radius: 9px !important;
+        font-weight: 600 !important; font-size: 14px !important;
+        padding: 10px 28px !important;
+    }
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg,#2563EB,#0891B2) !important;
+        color: white !important;
+        box-shadow: 0 3px 10px rgba(37,99,235,0.35) !important;
+    }
+    div[data-testid="stTextInput"] input {
+        background: rgba(255,255,255,0.06) !important;
+        border: 1px solid rgba(255,255,255,0.12) !important;
+        color: #F1F5F9 !important; border-radius: 10px !important;
+        padding: 12px 14px !important;
+    }
+    div[data-testid="stTextInput"] input::placeholder { color: #475569 !important; }
+    div[data-testid="stTextInput"] label { color: #94A3B8 !important; font-size: 13px !important; font-weight: 600 !important; }
+    </style>
+    ''', unsafe_allow_html=True)
+
+    _, auth_col, _ = st.columns([1, 1.3, 1])
+    with auth_col:
+        # ── Logo ──
+        st.markdown('''
+        <div style="text-align:center;padding:36px 0 20px;">
+            <div style="background:linear-gradient(135deg,#2563EB,#0891B2);width:70px;height:70px;
+                        border-radius:20px;display:inline-flex;align-items:center;justify-content:center;
+                        font-size:36px;box-shadow:0 12px 36px rgba(37,99,235,0.5);margin-bottom:16px;">🛡️</div>
+            <div style="font-family:'Space Grotesk',sans-serif;font-size:30px;font-weight:900;
+                        background:linear-gradient(135deg,#2563EB,#0891B2);
+                        -webkit-background-clip:text;-webkit-text-fill-color:transparent;line-height:1;">
+                VigilantAP
+            </div>
+            <div style="color:#475569;font-size:12px;letter-spacing:2.5px;text-transform:uppercase;margin-top:6px;">
+                Food Safety Intelligence Platform
+            </div>
+        </div>
+        ''', unsafe_allow_html=True)
+
+        # ── Sign In / Sign Up tabs ──
+        signin_tab, signup_tab = st.tabs(["🔐  Sign In", "✨  Sign Up"])
+
+        # ════════════════════════════════
+        # SIGN IN
+        # ════════════════════════════════
+        with signin_tab:
+            st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+            si_user = st.text_input('Username', placeholder='Enter your username', key='si_user')
+            si_pass = st.text_input('Password', type='password', placeholder='Enter your password', key='si_pass')
+
+            if st.session_state.login_error:
+                st.error(st.session_state.login_error)
+
+            st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
+            if st.button('🔐  Sign In', use_container_width=True, key='login_btn'):
+                if do_login(si_user.strip(), si_pass.strip()):
+                    st.rerun()
+
+            st.markdown('''
+            <div style="margin-top:20px;padding:16px;background:rgba(255,255,255,0.03);
+                        border:1px solid rgba(255,255,255,0.07);border-radius:12px;">
+                <div style="font-size:11px;color:#475569;font-weight:700;text-transform:uppercase;
+                            letter-spacing:0.8px;margin-bottom:10px;text-align:center;">Demo Credentials</div>
+                <div style="display:flex;flex-direction:column;gap:7px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;
+                                background:rgba(124,58,237,0.10);border:1px solid rgba(124,58,237,0.22);
+                                border-radius:8px;padding:7px 12px;">
+                        <span style="font-size:12px;color:#C4B5FD;font-weight:700;">👑 admin / admin123</span>
+                        <span style="font-size:11px;color:#64748B;">Platform Creator</span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;
+                                background:rgba(8,145,178,0.10);border:1px solid rgba(8,145,178,0.22);
+                                border-radius:8px;padding:7px 12px;">
+                        <span style="font-size:12px;color:#67E8F9;font-weight:700;">🏢 apfooddept / org2024</span>
+                        <span style="font-size:11px;color:#64748B;">Organisation · ₹9,999/mo</span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;
+                                background:rgba(37,99,235,0.08);border:1px solid rgba(37,99,235,0.18);
+                                border-radius:8px;padding:7px 12px;">
+                        <span style="font-size:12px;color:#93C5FD;font-weight:700;">⚡ inspector1 / pass123</span>
+                        <span style="font-size:11px;color:#64748B;">User · Pro ₹2,999/mo</span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;
+                                background:rgba(217,119,6,0.08);border:1px solid rgba(217,119,6,0.18);
+                                border-radius:8px;padding:7px 12px;">
+                        <span style="font-size:12px;color:#FCD34D;font-weight:700;">🔒 viewer1 / view123</span>
+                        <span style="font-size:11px;color:#64748B;">Free · No AI access</span>
+                    </div>
+                </div>
+            </div>
+            ''', unsafe_allow_html=True)
+
+        # ════════════════════════════════
+        # SIGN UP
+        # ════════════════════════════════
+        with signup_tab:
+            st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+
+            su_name  = st.text_input('Full Name',  placeholder='e.g. Srinivas Rao',          key='su_name')
+            su_email = st.text_input('Email',       placeholder='e.g. name@apgov.in',          key='su_email')
+            su_user  = st.text_input('Username',    placeholder='Choose a username (no spaces)', key='su_user')
+            su_pass  = st.text_input('Password',    type='password', placeholder='Min 6 characters', key='su_pass')
+            su_pass2 = st.text_input('Confirm Password', type='password', placeholder='Re-enter password', key='su_pass2')
+            su_plan  = st.selectbox('Select Plan', ['Free 🔓 — Basic access', 'Pro ⚡ — ₹2,999/mo (AI features)', 'Enterprise 🏆 — ₹9,999/mo (Organisation)'], key='su_plan')
+
+            if st.session_state.signup_error:
+                st.error(st.session_state.signup_error)
+            if st.session_state.signup_success:
+                st.success(st.session_state.signup_success)
+
+            st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
+            if st.button('✨  Create Account', use_container_width=True, key='signup_btn'):
+                _uname = su_user.strip()
+                _upass = su_pass.strip()
+                _uname2 = su_pass2.strip()
+                _name  = su_name.strip()
+                _email = su_email.strip()
+                _plan  = su_plan.split(' ')[0]  # 'Free', 'Pro', 'Enterprise'
+                _role  = 'org' if _plan == 'Enterprise' else 'user'
+
+                # Validation
+                if not all([_uname, _upass, _name, _email]):
+                    st.session_state.signup_error = '❌ All fields are required.'
+                    st.session_state.signup_success = ''
+                elif _uname in USERS_DB:
+                    st.session_state.signup_error = f'❌ Username "{_uname}" is already taken.'
+                    st.session_state.signup_success = ''
+                elif len(_upass) < 6:
+                    st.session_state.signup_error = '❌ Password must be at least 6 characters.'
+                    st.session_state.signup_success = ''
+                elif _upass != _uname2:
+                    st.session_state.signup_error = '❌ Passwords do not match.'
+                    st.session_state.signup_success = ''
+                elif '@' not in _email:
+                    st.session_state.signup_error = '❌ Please enter a valid email address.'
+                    st.session_state.signup_success = ''
+                else:
+                    from datetime import date
+                    # Write directly to session_state so it survives the rerun
+                    st.session_state.USERS_DB[_uname] = {
+                        'password':   _upass,
+                        'role':       _role,
+                        'name':       _name,
+                        'email':      _email,
+                        'subscribed': _plan != 'Free',
+                        'plan':       _plan,
+                        'joined':     str(date.today()),
+                    }
+                    st.session_state.signup_error   = ''
+                    st.session_state.signup_success = f'✅ Account created! Welcome, {_name}. You can now sign in.'
+                    st.rerun()
+
+            st.markdown('''
+            <div style="margin-top:14px;padding:12px 16px;background:rgba(37,99,235,0.06);
+                        border:1px solid rgba(37,99,235,0.15);border-radius:10px;
+                        font-size:12px;color:#64748B;line-height:1.7;">
+                🔒 Free plan has limited access. Pro &amp; Enterprise unlock AI Assistant,
+                Predictive Analytics, and premium features.
+            </div>
+            ''', unsafe_allow_html=True)
+
+    st.stop()
+
+# =========================================================
+# END AUTH BLOCK — user is now logged in
+# =========================================================
+
+# =========================================================
+# PLAN SELECTION PAGE (shown after first login for Free users)
+# =========================================================
+
+if st.session_state.logged_in and not st.session_state.plan_selected:
+    _ui_ps = current_user_info()
+    st.markdown('''
+    <style>
+    .stApp { background: linear-gradient(135deg,#0A0F1E 0%,#0F172A 50%,#0A0F1E 100%) !important; }
+    header,footer,#MainMenu { visibility:hidden !important; }
+    header[data-testid="stHeader"],div[data-testid="stDecoration"],.stAppHeader {
+        display:none !important; height:0 !important;
+    }
+    </style>
+    ''', unsafe_allow_html=True)
+
+    _, ps_col, _ = st.columns([1, 2.5, 1])
+    with ps_col:
+        st.markdown(f'''
+        <div style="text-align:center;padding:32px 0 28px;">
+            <div style="background:linear-gradient(135deg,#2563EB,#0891B2);width:64px;height:64px;
+                        border-radius:18px;display:inline-flex;align-items:center;justify-content:center;
+                        font-size:32px;box-shadow:0 12px 36px rgba(37,99,235,0.5);margin-bottom:14px;">🛡️</div>
+            <div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:900;
+                        background:linear-gradient(135deg,#2563EB,#0891B2);
+                        -webkit-background-clip:text;-webkit-text-fill-color:transparent;">
+                Welcome, {(_ui_ps.get("name","") or "").split()[0] if (_ui_ps.get("name","") or "").split() else ""}!
+            </div>
+            <div style="color:#64748B;font-size:14px;margin-top:6px;">Choose how you'd like to access VigilantAP</div>
+        </div>
+        ''', unsafe_allow_html=True)
+
+        # Trial card
+        st.markdown("""
+        <div style="background:linear-gradient(135deg,rgba(5,150,105,0.12),rgba(8,145,178,0.08));
+                    border:1.5px solid rgba(5,150,105,0.35);border-radius:20px;padding:28px;margin-bottom:16px;">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;">
+                <div style="background:rgba(5,150,105,0.15);border-radius:12px;width:48px;height:48px;
+                            display:flex;align-items:center;justify-content:center;font-size:24px;">🎯</div>
+                <div>
+                    <div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:800;color:#F1F5F9;">
+                        1-Day Free Trial
+                    </div>
+                    <div style="font-size:12px;color:#059669;font-weight:600;">Full access · No credit card needed</div>
+                </div>
+                <div style="margin-left:auto;font-size:26px;font-weight:900;color:#059669;">FREE</div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:7px;margin-bottom:16px;">
+                <div style="font-size:13px;color:#94A3B8;">✅ &nbsp;All dashboard tabs including AI Assistant</div>
+                <div style="font-size:13px;color:#94A3B8;">✅ &nbsp;Predictive Analytics & Risk Scoring</div>
+                <div style="font-size:13px;color:#94A3B8;">✅ &nbsp;District-level mapping & KPI dashboards</div>
+                <div style="font-size:13px;color:#94A3B8;">⏱️ &nbsp;Access expires after 24 hours</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("🎯  Start Free 1-Day Trial", use_container_width=True, key="trial_btn"):
+            from datetime import datetime as _dt
+            st.session_state.USERS_DB[st.session_state.current_user]['plan'] = 'Trial'
+            st.session_state.USERS_DB[st.session_state.current_user]['subscribed'] = True
+            if 'trial_start' not in st.session_state:
+                st.session_state.trial_start = {}
+            st.session_state.trial_start[st.session_state.current_user] = _dt.now()
+            st.session_state.plan_selected = True
+            st.rerun()
+
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+        # Pro card
+        st.markdown("""
+        <div style="background:linear-gradient(135deg,rgba(37,99,235,0.10),rgba(8,145,178,0.07));
+                    border:1.5px solid rgba(37,99,235,0.30);border-radius:20px;padding:28px;margin-bottom:16px;">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;">
+                <div style="background:rgba(37,99,235,0.15);border-radius:12px;width:48px;height:48px;
+                            display:flex;align-items:center;justify-content:center;font-size:24px;">⚡</div>
+                <div>
+                    <div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:800;color:#F1F5F9;">
+                        Pro — Individual
+                    </div>
+                    <div style="font-size:12px;color:#93C5FD;font-weight:600;">For inspectors & analysts · Monthly subscription</div>
+                </div>
+                <div style="margin-left:auto;text-align:right;">
+                    <div style="font-size:24px;font-weight:900;color:#2563EB;">₹2,999</div>
+                    <div style="font-size:11px;color:#64748B;">/month</div>
+                </div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:7px;margin-bottom:16px;">
+                <div style="font-size:13px;color:#94A3B8;">✅ &nbsp;Everything in Trial — unlimited</div>
+                <div style="font-size:13px;color:#94A3B8;">✅ &nbsp;AI Assistant with voice input</div>
+                <div style="font-size:13px;color:#94A3B8;">✅ &nbsp;Priority data refresh</div>
+                <div style="font-size:13px;color:#94A3B8;">✅ &nbsp;Export & reporting tools</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("⚡  Subscribe — Pro ₹2,999/mo", use_container_width=True, key="pro_plan_btn"):
+            st.session_state.pending_payment_plan = 'Pro'
+            st.session_state.show_payment_page = True
+            st.rerun()
+
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+        # Enterprise card
+        st.markdown("""
+        <div style="background:linear-gradient(135deg,rgba(124,58,237,0.10),rgba(139,92,246,0.07));
+                    border:1.5px solid rgba(124,58,237,0.30);border-radius:20px;padding:28px;margin-bottom:16px;">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;">
+                <div style="background:rgba(124,58,237,0.15);border-radius:12px;width:48px;height:48px;
+                            display:flex;align-items:center;justify-content:center;font-size:24px;">🏆</div>
+                <div>
+                    <div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:800;color:#F1F5F9;">
+                        Enterprise — Organisation
+                    </div>
+                    <div style="font-size:12px;color:#C4B5FD;font-weight:600;">For government depts & organisations · Monthly</div>
+                </div>
+                <div style="margin-left:auto;text-align:right;">
+                    <div style="font-size:24px;font-weight:900;color:#7C3AED;">₹9,999</div>
+                    <div style="font-size:11px;color:#64748B;">/month</div>
+                </div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:7px;margin-bottom:16px;">
+                <div style="font-size:13px;color:#94A3B8;">✅ &nbsp;Everything in Pro</div>
+                <div style="font-size:13px;color:#94A3B8;">✅ &nbsp;Unlimited user seats</div>
+                <div style="font-size:13px;color:#94A3B8;">✅ &nbsp;Dedicated support & onboarding</div>
+                <div style="font-size:13px;color:#94A3B8;">✅ &nbsp;Custom integrations & SLA</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("🏆  Subscribe — Enterprise ₹9,999/mo", use_container_width=True, key="ent_plan_btn"):
+            st.session_state.pending_payment_plan = 'Enterprise'
+            st.session_state.show_payment_page = True
+            st.rerun()
+
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        if st.button("🔒  Continue with Free (Limited Access)", use_container_width=True, key="free_plan_btn"):
+            st.session_state.plan_selected = True
+            st.rerun()
+
+    st.stop()
+
+# =========================================================
+# PAYMENT PAGE
+# =========================================================
+
+if st.session_state.logged_in and st.session_state.show_payment_page:
+    _plan_pay = st.session_state.pending_payment_plan or 'Pro'
+    _price    = PLANS[_plan_pay]['price']
+    _icon     = PLANS[_plan_pay]['icon']
+    _color    = PLANS[_plan_pay]['color']
+
+    st.markdown('''
+    <style>
+    .stApp { background: linear-gradient(135deg,#0A0F1E 0%,#0F172A 50%,#0A0F1E 100%) !important; }
+    header,footer,#MainMenu { visibility:hidden !important; }
+    header[data-testid="stHeader"],div[data-testid="stDecoration"],.stAppHeader {
+        display:none !important; height:0 !important;
+    }
+    div[data-testid="stTextInput"] input {
+        background: rgba(255,255,255,0.06) !important;
+        border: 1px solid rgba(255,255,255,0.12) !important;
+        color: #F1F5F9 !important; border-radius: 10px !important;
+        padding: 12px 14px !important;
+    }
+    div[data-testid="stTextInput"] label { color: #94A3B8 !important; font-size: 13px !important; font-weight: 600 !important; }
+    </style>
+    ''', unsafe_allow_html=True)
+
+    _, pay_col, _ = st.columns([1, 2, 1])
+    with pay_col:
+        st.markdown(f'''
+        <div style="text-align:center;padding:28px 0 20px;">
+            <div style="font-family:'Space Grotesk',sans-serif;font-size:26px;font-weight:900;
+                        background:linear-gradient(135deg,#2563EB,#0891B2);
+                        -webkit-background-clip:text;-webkit-text-fill-color:transparent;">
+                {_icon} Complete Payment
+            </div>
+            <div style="color:#64748B;font-size:13px;margin-top:6px;">
+                Subscribing to <b style="color:{_color};">{_plan_pay} Plan</b> — ₹{_price:,}/month
+            </div>
+        </div>
+        ''', unsafe_allow_html=True)
+
+        # Order summary
+        st.markdown(f"""
+        <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.10);
+                    border-radius:16px;padding:20px;margin-bottom:20px;">
+            <div style="font-size:13px;font-weight:700;color:#94A3B8;text-transform:uppercase;
+                        letter-spacing:0.8px;margin-bottom:14px;">Order Summary</div>
+            <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+                <span style="color:#CBD5E1;font-size:14px;">{_icon} VigilantAP {_plan_pay}</span>
+                <span style="color:#F1F5F9;font-weight:700;">₹{_price:,}/mo</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+                <span style="color:#CBD5E1;font-size:14px;">GST (18%)</span>
+                <span style="color:#F1F5F9;font-weight:700;">₹{int(_price*0.18):,}</span>
+            </div>
+            <div style="border-top:1px solid rgba(255,255,255,0.08);margin:10px 0;"></div>
+            <div style="display:flex;justify-content:space-between;">
+                <span style="color:#F1F5F9;font-weight:800;font-size:16px;">Total</span>
+                <span style="color:{_color};font-weight:900;font-size:18px;">₹{int(_price*1.18):,}/mo</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Payment form fields
+        st.markdown('<div style="color:#94A3B8;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:8px;">Card Details</div>', unsafe_allow_html=True)
+        pay_card   = st.text_input("Card Number", placeholder="4111 1111 1111 1111", key="pay_card")
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            pay_exp = st.text_input("Expiry (MM/YY)", placeholder="12/27", key="pay_exp")
+        with pc2:
+            pay_cvv = st.text_input("CVV", placeholder="•••", type="password", key="pay_cvv")
+        pay_name = st.text_input("Cardholder Name", placeholder="As on card", key="pay_name")
+
+        upi_or   = st.markdown('<div style="text-align:center;color:#64748B;font-size:12px;margin:12px 0;">— or pay via —</div>', unsafe_allow_html=True)
+        pay_upi  = st.text_input("UPI ID", placeholder="yourname@upi", key="pay_upi")
+
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        if st.button(f"💳  Pay ₹{int(_price*1.18):,} & Activate {_plan_pay}", use_container_width=True, key="pay_now_btn"):
+            # Simulate successful payment — activate plan
+            _uname_pay = st.session_state.current_user
+            _role_pay  = 'org' if _plan_pay == 'Enterprise' else 'user'
+            st.session_state.USERS_DB[_uname_pay]['plan']       = _plan_pay
+            st.session_state.USERS_DB[_uname_pay]['subscribed'] = True
+            st.session_state.USERS_DB[_uname_pay]['role']       = _role_pay
+            st.session_state.show_payment_page   = False
+            st.session_state.pending_payment_plan = None
+            st.session_state.plan_selected        = True
+            st.success(f"🎉 Payment successful! {_plan_pay} plan activated.")
+            import time; time.sleep(1)
+            st.rerun()
+
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        if st.button("← Back to Plans", use_container_width=False, key="back_to_plans_btn"):
+            st.session_state.show_payment_page = False
+            st.session_state.pending_payment_plan = None
+            st.rerun()
+
+        st.markdown("""
+        <div style="margin-top:16px;text-align:center;color:#475569;font-size:11px;">
+            🔒 256-bit SSL encrypted · Secured by Razorpay · Cancel anytime
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.stop()
 
 # =========================================================
 # FAIL-SAFE INTRO SPLASH SCREEN WITH TRIGGERED VOICE GREETING
@@ -118,22 +756,15 @@ if not st.session_state.welcome_screen_seen:
     """, unsafe_allow_html=True)
 
     # 2. Native python streamlit button positioned and locked into the user interface overlay design
-    if st.button("Initialize Platform", use_container_width=False):
+    if st.button("Initialize Platform", use_container_width=False, key="init_platform_btn"):
         st.session_state.welcome_screen_seen = True
         st.rerun()
         
     st.stop()
     
 # =========================================================
-# PAGE CONFIG
+# GROQ KEY CHECK
 # =========================================================
-
-st.set_page_config(
-    page_title="VigilantAP | Food Safety Intelligence",
-    page_icon="🛡️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
 if not GROQ_API_KEY:
     st.error(
@@ -683,6 +1314,28 @@ p,li,label,span {{ color: var(--text-dim) !important; }}
 </style>
 """, unsafe_allow_html=True)
 
+# ── PRO PLAN: hide sidebar entirely so full width is used for inline filters ──
+if is_pro_plan():
+    st.markdown("""
+    <style>
+    section[data-testid="stSidebar"] {
+        display: none !important;
+        width: 0px !important;
+        min-width: 0px !important;
+        max-width: 0px !important;
+        overflow: hidden !important;
+        visibility: hidden !important;
+    }
+    section[data-testid="stSidebar"] + div,
+    .main .block-container {
+        margin-left: 0 !important;
+        padding-left: 2rem !important;
+        max-width: 100% !important;
+    }
+    button[kind="header"] { display: none !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
 
 # =========================================================
 # PLOTLY CHART TEMPLATE
@@ -932,7 +1585,7 @@ with st.sidebar:
     with col_dark:
         st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
         dark_label = "☀️" if st.session_state.dark_mode else "🌙"
-        if st.button(dark_label, help="Toggle dark/light mode"):
+        if st.button(dark_label, help="Toggle dark/light mode", key="dark_mode_btn"):
             st.session_state.dark_mode = not st.session_state.dark_mode
             st.rerun()
 
@@ -943,130 +1596,240 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    for icon, label, val in [
-        ("📦", "Total Records",   f"{len(samples):,}"),
-        ("🍔", "Food Categories", samples['CategoryName'].nunique()),
-        ("📅", "Date Range",      "2024 – 2025"),
-    ]:
-        st.markdown(f"""
-        <div style="background:var(--bg-card2);border:1px solid var(--border);
-                    border-radius:10px;padding:11px 14px;margin-bottom:8px;
+    if not is_admin() and not is_pro_plan():
+        # ── ENTERPRISE / ORG users: full sidebar with stats + filters ──
+        for icon, label, val in [
+            ("📦", "Total Records",   f"{len(samples):,}"),
+            ("🍔", "Food Categories", samples['CategoryName'].nunique()),
+            ("📅", "Date Range",      "2024 – 2025"),
+        ]:
+            st.markdown(f"""
+            <div style="background:var(--bg-card2);border:1px solid var(--border);
+                        border-radius:10px;padding:11px 14px;margin-bottom:8px;
+                        display:flex;align-items:center;gap:10px;">
+                <span style="font-size:18px;">{icon}</span>
+                <div>
+                    <div style="font-size:11px;color:#94A3B8;text-transform:uppercase;letter-spacing:0.5px;">{label}</div>
+                    <div style="font-size:15px;font-weight:700;color:var(--text-primary);">{val}</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<hr style='border-color:var(--border);margin:14px 0;'>", unsafe_allow_html=True)
+        st.markdown("""
+        <div style="background:rgba(249,115,22,0.08);border:1px solid rgba(249,115,22,0.2);
+                    border-radius:10px;padding:10px 14px;margin-bottom:14px;
                     display:flex;align-items:center;gap:10px;">
-            <span style="font-size:18px;">{icon}</span>
+            <span style="font-size:18px;">⚡</span>
             <div>
-                <div style="font-size:11px;color:#94A3B8;text-transform:uppercase;letter-spacing:0.5px;">{label}</div>
-                <div style="font-size:15px;font-weight:700;color:var(--text-primary);">{val}</div>
+                <div style="font-size:11px;color:#94A3B8;text-transform:uppercase;letter-spacing:0.5px;">AI Engine</div>
+                <div style="font-size:14px;font-weight:700;color:#F97316;">Groq · LLaMA-3 70B</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-    st.markdown("<hr style='border-color:var(--border);margin:14px 0;'>", unsafe_allow_html=True)
-    st.markdown("""
-    <div style="background:rgba(249,115,22,0.08);border:1px solid rgba(249,115,22,0.2);
-                border-radius:10px;padding:10px 14px;margin-bottom:14px;
-                display:flex;align-items:center;gap:10px;">
-        <span style="font-size:18px;">⚡</span>
-        <div>
-            <div style="font-size:11px;color:#94A3B8;text-transform:uppercase;letter-spacing:0.5px;">AI Engine</div>
-            <div style="font-size:14px;font-weight:700;color:#F97316;">Groq · LLaMA-3 70B</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+        def _section(icon, title):
+            st.markdown(
+                f"<div style='font-size:11px;font-weight:700;color:#94A3B8;letter-spacing:1px;"
+                f"text-transform:uppercase;margin-bottom:6px;'>{icon} {title}</div>",
+                unsafe_allow_html=True
+            )
 
-    def _section(icon, title):
-        st.markdown(
-            f"<div style='font-size:11px;font-weight:700;color:#94A3B8;letter-spacing:1px;"
-            f"text-transform:uppercase;margin-bottom:6px;'>{icon} {title}</div>",
-            unsafe_allow_html=True
-        )
+        _section("📅", "Month")
+        month_filter = st.selectbox("Month", ["All Months"] + sorted(samples["DateTested"].dt.strftime("%b %Y").dropna().unique()), label_visibility="collapsed")
+        _section("📍", "District")
+        district_filter = st.selectbox("District", ["All Districts"] + sorted(samples["DistrictName"].dropna().unique()), label_visibility="collapsed")
+        _section("🍔", "Food Category")
+        category_filter = st.selectbox("Category", ["All Categories"] + sorted(samples["CategoryName"].dropna().unique()), label_visibility="collapsed")
+        _section("🧪", "Test Result")
+        result_filter = st.selectbox("Result", ["All Results"] + sorted(samples["TestResult"].dropna().unique()), label_visibility="collapsed")
 
-    _section("📅", "Month")
-    month_filter = st.selectbox("Month", ["All Months"] + sorted(samples["DateTested"].dt.strftime("%b %Y").dropna().unique()), label_visibility="collapsed")
-    _section("📍", "District")
-    district_filter = st.selectbox("District", ["All Districts"] + sorted(samples["DistrictName"].dropna().unique()), label_visibility="collapsed")
-    _section("🍔", "Food Category")
-    category_filter = st.selectbox("Category", ["All Categories"] + sorted(samples["CategoryName"].dropna().unique()), label_visibility="collapsed")
-    _section("🧪", "Test Result")
-    result_filter = st.selectbox("Result", ["All Results"] + sorted(samples["TestResult"].dropna().unique()), label_visibility="collapsed")
+        st.markdown("<hr style='border-color:var(--border);margin:14px 0;'>", unsafe_allow_html=True)
+        only_failed = st.checkbox("⚠️ Only Failed Samples", key="cb_only_failed")
+        only_passed = st.checkbox("✅ Only Passed Samples", key="cb_only_passed")
 
-    st.markdown("<hr style='border-color:var(--border);margin:14px 0;'>", unsafe_allow_html=True)
-    only_failed = st.checkbox("⚠️ Only Failed Samples")
-    only_passed = st.checkbox("✅ Only Passed Samples")
+        st.markdown("<hr style='border-color:var(--border);margin:14px 0;'>", unsafe_allow_html=True)
+        if st.button("🔍 Run Anomaly Scan", use_container_width=True, key="anomaly_scan_btn"):
+            st.session_state.anomalies_detected = True
 
-    st.markdown("<hr style='border-color:var(--border);margin:14px 0;'>", unsafe_allow_html=True)
-    if st.button("🔍 Run Anomaly Scan", use_container_width=True):
-        st.session_state.anomalies_detected = True
-
-    st.markdown("<hr style='border-color:var(--border);margin:14px 0;'>", unsafe_allow_html=True)
-    st.markdown("""
-    <div style="background:#FFF5F6;border:1px solid rgba(225,29,72,0.2);border-radius:14px;padding:18px;">
-        <div style="font-size:14px;font-weight:700;color:#E11D48;margin-bottom:12px;">🚨 Active Risk Alert</div>
-        <div style="font-size:13px;color:#475569;line-height:1.8;">
-            📌 <b style='color:#0F172A;'>High Risk:</b> Milk &amp; Oils<br>
-            📍 <b style='color:#0F172A;'>Critical:</b> Tirupati District<br>
-            ⚠️ <b style='color:#0F172A;'>Failure Rate:</b> 32.4%<br>
-            <div style="margin-top:10px;padding:10px;background:rgba(225,29,72,0.06);border-radius:10px;font-size:12px;color:#64748B;">
-                💡 Increase inspections &amp; monitor oil-based products weekly.
+        st.markdown("<hr style='border-color:var(--border);margin:14px 0;'>", unsafe_allow_html=True)
+        st.markdown("""
+        <div style="background:#FFF5F6;border:1px solid rgba(225,29,72,0.2);border-radius:14px;padding:18px;">
+            <div style="font-size:14px;font-weight:700;color:#E11D48;margin-bottom:12px;">🚨 Active Risk Alert</div>
+            <div style="font-size:13px;color:#475569;line-height:1.8;">
+                📌 <b style='color:#0F172A;'>High Risk:</b> Milk &amp; Oils<br>
+                📍 <b style='color:#0F172A;'>Critical:</b> Tirupati District<br>
+                ⚠️ <b style='color:#0F172A;'>Failure Rate:</b> 32.4%<br>
+                <div style="margin-top:10px;padding:10px;background:rgba(225,29,06,0.06);border-radius:10px;font-size:12px;color:#64748B;">
+                    💡 Increase inspections &amp; monitor oil-based products weekly.
+                </div>
             </div>
         </div>
+        """, unsafe_allow_html=True)
+
+    elif is_pro_plan():
+        # ── PRO users: sidebar is hidden via CSS — set neutral placeholder vars ──
+        month_filter    = "All Months"
+        district_filter = "All Districts"
+        category_filter = "All Categories"
+        result_filter   = "All Results"
+        only_failed     = False
+        only_passed     = False
+
+    else:
+        # ── ADMIN: placeholder vars so rest of file doesn't crash ──
+        month_filter    = "All Months"
+        district_filter = "All Districts"
+        category_filter = "All Categories"
+        result_filter   = "All Results"
+        only_failed     = False
+        only_passed     = False
+
+    # ---- USER INFO + LOGOUT ----
+    st.markdown("<hr style='border-color:var(--border);margin:14px 0;'>", unsafe_allow_html=True)
+    _ui = current_user_info()
+    _plan_color = PLANS.get(_ui.get('plan','Free'),{}).get('color','#64748B')
+    _plan_icon  = PLANS.get(_ui.get('plan','Free'),{}).get('icon','🔓')
+    _plan_name  = _ui.get('plan','Free')
+    _user_icon  = '👑' if is_admin() else '👤'
+
+    # Build badge HTML as pure Python strings (avoids f-string nesting issues)
+    _admin_badge = (
+        '<span style="background:rgba(124,58,237,0.10);color:#7C3AED;border:1px solid rgba(124,58,237,0.25);'
+        'border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;">👑 Admin</span>'
+    ) if is_admin() else ''
+
+    if is_trial_expired():
+        _sub_badge = (
+            '<span style="background:rgba(225,29,72,0.10);color:#E11D48;border:1px solid rgba(225,29,72,0.25);'
+            'border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;">⏰ Trial Expired</span>'
+        )
+    elif _plan_name == 'Trial' and is_trial_active():
+        _secs_rem = trial_time_remaining()
+        _hrs_rem  = int(_secs_rem // 3600)
+        _sub_badge = (
+            f'<span style="background:rgba(5,150,105,0.10);color:#059669;border:1px solid rgba(5,150,105,0.25);'
+            f'border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;">🎯 Trial · {_hrs_rem}h left</span>'
+        )
+    elif is_subscribed():
+        _sub_badge = (
+            '<span style="background:rgba(5,150,105,0.10);color:#059669;border:1px solid rgba(5,150,105,0.25);'
+            'border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;">✅ Active</span>'
+        )
+    else:
+        _sub_badge = (
+            '<span style="background:rgba(217,119,6,0.10);color:#D97706;border:1px solid rgba(217,119,6,0.25);'
+            'border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;">🔒 Free Tier</span>'
+        )
+
+    _plan_badge = (
+        f'<span style="background:{_plan_color}18;color:{_plan_color};'
+        f'border:1px solid {_plan_color}30;border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;">'
+        f'{_plan_icon} {_plan_name} Plan</span>'
+    )
+
+    st.markdown(f"""
+    <div style="background:var(--bg-card2);border:1px solid var(--border);border-radius:14px;
+                padding:14px 16px;margin-bottom:10px;">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+            <div style="width:36px;height:36px;border-radius:10px;
+                        background:linear-gradient(135deg,#2563EB,#0891B2);
+                        display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;">
+                {_user_icon}
+            </div>
+            <div>
+                <div style="font-size:14px;font-weight:700;color:var(--text-primary);">{_ui.get('name','')}</div>
+                <div style="font-size:11px;color:#94A3B8;">{_ui.get('email','')}</div>
+            </div>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+            {_plan_badge}
+            {_admin_badge}
+            {_sub_badge}
+        </div>
     </div>
     """, unsafe_allow_html=True)
 
+    # Admin panel shortcut
+    if is_admin():
+        if 'show_admin' not in st.session_state:
+            st.session_state.show_admin = False
+        if st.button("🛠️ Admin Dashboard", use_container_width=True, key="admin_btn"):
+            st.session_state.show_admin = not st.session_state.show_admin
+            st.rerun()
+
+    # Upgrade button for free/trial users
+    if not is_admin() and not is_org() and not (is_subscribed() and current_user_info().get('plan') in ('Pro','Enterprise')):
+        if st.button("⚡ Upgrade Plan", use_container_width=True, key="sidebar_upgrade_btn"):
+            st.session_state.plan_selected = False
+            st.rerun()
+
+    if st.button("🚪 Logout", use_container_width=True, key="logout_btn"):
+        do_logout()
+        st.rerun()
+
 
 # =========================================================
-# FILTER DATA
+# FILTER DATA + KPI VALUES (skipped for admin)
 # =========================================================
 
-filtered = samples.copy()
-if month_filter     != "All Months":     filtered = filtered[filtered["DateTested"].dt.strftime("%b %Y") == month_filter]
-if district_filter  != "All Districts":  filtered = filtered[filtered["DistrictName"] == district_filter]
-if category_filter  != "All Categories": filtered = filtered[filtered["CategoryName"] == category_filter]
-if result_filter    != "All Results":    filtered = filtered[filtered["TestResult"] == result_filter]
-if only_failed:  filtered = filtered[filtered["TestResult"] == "Fail"]
-if only_passed:  filtered = filtered[filtered["TestResult"] == "Pass"]
+if not is_admin():
+    filtered = samples.copy()
+    if month_filter     != "All Months":     filtered = filtered[filtered["DateTested"].dt.strftime("%b %Y") == month_filter]
+    if district_filter  != "All Districts":  filtered = filtered[filtered["DistrictName"] == district_filter]
+    if category_filter  != "All Categories": filtered = filtered[filtered["CategoryName"] == category_filter]
+    if result_filter    != "All Results":    filtered = filtered[filtered["TestResult"] == result_filter]
+    if only_failed:  filtered = filtered[filtered["TestResult"] == "Fail"]
+    if only_passed:  filtered = filtered[filtered["TestResult"] == "Pass"]
 
-filtered_health = health.copy()
-if district_filter != "All Districts":
-    filtered_health = filtered_health[filtered_health["DistrictName"] == district_filter]
+    filtered_health = health.copy()
+    if district_filter != "All Districts":
+        filtered_health = filtered_health[filtered_health["DistrictName"] == district_filter]
 
+    total_samples = len(filtered)
+    failed        = len(filtered[filtered["TestResult"] == "Fail"])
+    passed        = len(filtered[filtered["TestResult"] == "Pass"])
+    adulteration  = round((failed / total_samples) * 100, 2) if total_samples > 0 else 0
+    health_cases  = int(filtered_health["PatientCount"].sum())
+    pass_rate     = round((passed / total_samples) * 100, 1) if total_samples > 0 else 0
+    top_risk_cat  = (filtered[filtered["TestResult"] == "Fail"].groupby("CategoryName").size().idxmax() if failed > 0 else "N/A")
+    top_risk_dist = (filtered[filtered["TestResult"] == "Fail"].groupby("DistrictName").size().idxmax() if failed > 0 else "N/A")
 
-# =========================================================
-# KPI VALUES
-# =========================================================
+    district_fail_rates = (
+        filtered.groupby("DistrictName")
+        .apply(lambda x: round((x["TestResult"] == "Fail").mean() * 100, 1))
+        .reset_index(name="FailRate")
+        .sort_values("FailRate", ascending=False)
+    )
+    top5_districts = district_fail_rates.head(5)["DistrictName"].tolist()
+    top5_rates     = district_fail_rates.head(5)["FailRate"].tolist()
 
-total_samples = len(filtered)
-failed        = len(filtered[filtered["TestResult"] == "Fail"])
-passed        = len(filtered[filtered["TestResult"] == "Pass"])
-adulteration  = round((failed / total_samples) * 100, 2) if total_samples > 0 else 0
-health_cases  = int(filtered_health["PatientCount"].sum())
-pass_rate     = round((passed / total_samples) * 100, 1) if total_samples > 0 else 0
-top_risk_cat  = (filtered[filtered["TestResult"] == "Fail"].groupby("CategoryName").size().idxmax() if failed > 0 else "N/A")
-top_risk_dist = (filtered[filtered["TestResult"] == "Fail"].groupby("DistrictName").size().idxmax() if failed > 0 else "N/A")
-
-district_fail_rates = (
-    filtered.groupby("DistrictName")
-    .apply(lambda x: round((x["TestResult"] == "Fail").mean() * 100, 1))
-    .reset_index(name="FailRate")
-    .sort_values("FailRate", ascending=False)
-)
-top5_districts = district_fail_rates.head(5)["DistrictName"].tolist()
-top5_rates     = district_fail_rates.head(5)["FailRate"].tolist()
-
-cat_fail_rates = (
-    filtered.groupby("CategoryName")
-    .apply(lambda x: round((x["TestResult"] == "Fail").mean() * 100, 1))
-    .reset_index(name="FailRate")
-    .sort_values("FailRate", ascending=False)
-)
-top_cat_name = cat_fail_rates.iloc[0]["CategoryName"] if len(cat_fail_rates) > 0 else "N/A"
-top_cat_rate = cat_fail_rates.iloc[0]["FailRate"] if len(cat_fail_rates) > 0 else 0
+    cat_fail_rates = (
+        filtered.groupby("CategoryName")
+        .apply(lambda x: round((x["TestResult"] == "Fail").mean() * 100, 1))
+        .reset_index(name="FailRate")
+        .sort_values("FailRate", ascending=False)
+    )
+    top_cat_name = cat_fail_rates.iloc[0]["CategoryName"] if len(cat_fail_rates) > 0 else "N/A"
+    top_cat_rate = cat_fail_rates.iloc[0]["FailRate"] if len(cat_fail_rates) > 0 else 0
+else:
+    # Admin doesn't use dashboard data — set safe defaults
+    filtered        = samples.copy()
+    filtered_health = health.copy()
+    total_samples   = 0; failed = 0; passed = 0
+    adulteration    = 0; health_cases = 0; pass_rate = 0
+    top_risk_cat    = "N/A"; top_risk_dist = "N/A"
+    district_fail_rates = pd.DataFrame(columns=["DistrictName","FailRate"])
+    top5_districts  = []; top5_rates = []
+    cat_fail_rates  = pd.DataFrame(columns=["CategoryName","FailRate"])
+    top_cat_name    = "N/A"; top_cat_rate = 0
 
 
 # =========================================================
 # ANOMALY DETECTION DISPLAY
 # =========================================================
 
-if st.session_state.anomalies_detected:
+if not is_admin() and st.session_state.anomalies_detected:
     anomalies = detect_anomalies(filtered)
     if not anomalies.empty:
         st.markdown(f"""
@@ -1100,48 +1863,88 @@ if st.session_state.anomalies_detected:
 # PAGE HEADER
 # =========================================================
 
-col_h1, col_h2 = st.columns([6, 2])
-with col_h1:
-    st.markdown("""
-    <div style="padding:8px 0 4px;">
-        <div style="font-family:'Space Grotesk',sans-serif;font-size:40px;font-weight:900;
-                    background:linear-gradient(135deg,#2563EB,#0891B2);
-                    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-                    background-clip:text;line-height:1.1;">
-            🛡️ VigilantAP
+if not is_admin():
+    col_h1, col_h2 = st.columns([6, 2])
+    with col_h1:
+        st.markdown("""
+        <div style="padding:8px 0 4px;">
+            <div style="font-family:'Space Grotesk',sans-serif;font-size:40px;font-weight:900;
+                        background:linear-gradient(135deg,#2563EB,#0891B2);
+                        -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+                        background-clip:text;line-height:1.1;">
+                🛡️ VigilantAP
+            </div>
+            <div style="color:#64748B;font-size:15px;font-weight:500;margin-top:4px;letter-spacing:0.3px;">
+                Food Safety &amp; Public Health Intelligence Dashboard — Andhra Pradesh
+            </div>
         </div>
-        <div style="color:#64748B;font-size:15px;font-weight:500;margin-top:4px;letter-spacing:0.3px;">
-            Food Safety &amp; Public Health Intelligence Dashboard — Andhra Pradesh
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-with col_h2:
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-    st.download_button(
-        "📥 Export Report",
-        data=filtered.to_csv(index=False),
-        file_name=f"vigilantap_report_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv"
-    )
+        """, unsafe_allow_html=True)
+    with col_h2:
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        st.download_button(
+            "📥 Export Report",
+            data=filtered.to_csv(index=False),
+            file_name=f"vigilantap_report_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
 
-st.markdown("<hr style='border-color:var(--border);margin:10px 0 18px;'>", unsafe_allow_html=True)
+    st.markdown("<hr style='border-color:var(--border);margin:10px 0 18px;'>", unsafe_allow_html=True)
 
 
 # =========================================================
 # TABS
 # =========================================================
 
-home, tab1, tab2, tab3, tab4, tab5, tab_ai, tab_predict, tab6 = st.tabs([
-    "🏠 Home",
-    "📊 Executive Overview",
-    "🧪 Sample Analysis",
-    "⚠️ Risk Analytics",
-    "🏥 Health Impact",
-    "🎯 Intervention",
-    "🤖 AI Assistant",
-    "🔮 Predictive Analytics",
-    "ℹ️ About"
-])
+# Build tab list based on role/subscription
+# Admin sees ONLY Admin + Revenue tabs — no dashboard tabs
+if can_see_admin_panel():
+    _tab_labels = ["🛠️ Admin", "💰 Revenue"]
+    _tabs = st.tabs(_tab_labels)
+    home        = None
+    tab1        = None
+    tab2        = None
+    tab3        = None
+    tab4        = None
+    tab5        = None
+    tab6        = None
+    tab_ai      = None
+    tab_predict = None
+    tab_admin   = _tabs[0]
+    tab_revenue = _tabs[1]
+else:
+    _tab_labels = [
+        "🏠 Home",
+        "📊 Executive Overview",
+        "🧪 Sample Analysis",
+        "⚠️ Risk Analytics",
+        "🏥 Health Impact",
+        "🎯 Intervention",
+    ]
+    # AI tabs — only shown to subscribed users and orgs
+    if can_see_ai():
+        _tab_labels += ["🤖 AI Assistant", "🔮 Predictive Analytics"]
+
+    _tab_labels += ["ℹ️ About"]
+
+    _tabs = st.tabs(_tab_labels)
+    home  = _tabs[0]
+    tab1  = _tabs[1]
+    tab2  = _tabs[2]
+    tab3  = _tabs[3]
+    tab4  = _tabs[4]
+    tab5  = _tabs[5]
+
+    _idx = 6
+    if can_see_ai():
+        tab_ai      = _tabs[_idx];     _idx += 1
+        tab_predict = _tabs[_idx];     _idx += 1
+    else:
+        tab_ai      = None
+        tab_predict = None
+
+    tab6        = _tabs[_idx]
+    tab_admin   = None
+    tab_revenue = None
 
 
 # =========================================================
@@ -1164,88 +1967,106 @@ def kpi(icon, label, value, delta_text, delta_type="up", color_class="kpi-blue")
 # HOME TAB
 # =========================================================
 
-with home:
-    st.markdown("""
-    <div style="background:linear-gradient(135deg,#EFF6FF,#F0FDFA,#FFF);
-                border:1px solid rgba(37,99,235,0.12);border-radius:22px;
-                padding:42px 40px;margin-bottom:28px;position:relative;overflow:hidden;">
-        <div style="position:absolute;top:-60px;right:-60px;width:240px;height:240px;
-                    background:radial-gradient(circle,rgba(37,99,235,0.08),transparent 70%);
-                    border-radius:50%;pointer-events:none;"></div>
-        <div style="font-family:'Space Grotesk',sans-serif;font-size:36px;font-weight:900;color:#0F172A;margin-bottom:12px;">
-            Welcome to VigilantAP 🛡️
-        </div>
-        <div style="color:#475569;font-size:16px;line-height:1.8;max-width:680px;">
-            An advanced AI-powered food safety intelligence platform designed to monitor food adulteration,
-            identify district-level risks, track public health impact, and guide government intervention across Andhra Pradesh.
-        </div>
-        <div style="display:flex;gap:12px;margin-top:24px;flex-wrap:wrap;">
-            <div style="background:rgba(225,29,72,0.07);border:1px solid rgba(225,29,72,0.18);border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;color:#E11D48;">🔴 Live Monitoring Active</div>
-            <div style="background:rgba(5,150,105,0.07);border:1px solid rgba(5,150,105,0.18);border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;color:#059669;">✅ 26 Districts Covered</div>
-            <div style="background:rgba(217,119,6,0.07);border:1px solid rgba(217,119,6,0.18);border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;color:#D97706;">⚡ Real-time Analytics</div>
-            <div style="background:rgba(249,115,22,0.07);border:1px solid rgba(249,115,22,0.18);border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;color:#F97316;">⚡ Groq AI · LLaMA-3 70B</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    modules = [
-        ("#2563EB","#0891B2","📊","Executive Overview","High-level KPIs, risk meter, and district-wise adulteration performance at a glance."),
-        ("#7C3AED","#A78BFA","🧪","Sample Analysis","Passed vs failed food samples, monthly testing trends, and category-level contamination breakdowns."),
-        ("#E11D48","#FB7185","⚠️","Risk Analytics","Heat maps, failure trends, top high-risk districts, and AI-driven risk scoring."),
-        ("#D97706","#F59E0B","🏥","Health Impact","Disease distribution, patient count trends, seasonal analysis, and correlation insights."),
-        ("#059669","#34D399","🎯","Intervention","Priority action dashboard, government alerts, inspection coverage, and smart recommendations."),
-        ("#F97316","#FB923C","🤖","AI Assistant","Chat with Groq AI (LLaMA-3 70B) to get instant food safety insights and action plans."),
-        ("#0E7490","#06B6D4","🔮","Predictive Analytics","AI-generated forecasts, trend projections, and future risk scenario modeling."),
-        ("#DB2777","#F472B6","ℹ️","About","Platform workflow, technology stack, objectives, and future enhancement roadmap."),
-    ]
-
-    r1 = st.columns(4)
-    r2 = st.columns(4)
-    for i, (c1, c2, icon, title, desc) in enumerate(modules):
-        row = r1 if i < 4 else r2
-        with row[i % 4]:
-            st.markdown(f"""
-            <div style="background:var(--bg-card);border:1px solid rgba(0,0,0,0.07);border-radius:18px;
-                        padding:22px;margin-bottom:16px;position:relative;overflow:hidden;
-                        box-shadow:0 1px 3px rgba(0,0,0,0.05);height:180px;">
-                <div style="position:absolute;top:0;left:0;right:0;height:3px;
-                            background:linear-gradient(90deg,{c1},{c2});border-radius:18px 18px 0 0;"></div>
-                <div style="font-size:26px;margin-bottom:8px;">{icon}</div>
-                <div style="font-family:'Space Grotesk',sans-serif;font-size:15px;font-weight:700;
-                            color:var(--text-primary);margin-bottom:6px;">{title}</div>
-                <div style="font-size:12px;color:#64748B;line-height:1.5;">{desc}</div>
+if home is not None:
+    with home:
+        # Trial expiry banner
+        if is_trial_expired():
+            st.markdown("""
+            <div style="background:linear-gradient(135deg,rgba(225,29,72,0.10),rgba(217,119,6,0.08));
+                        border:1.5px solid rgba(225,29,72,0.35);border-radius:16px;
+                        padding:20px 24px;margin-bottom:18px;display:flex;align-items:center;gap:16px;">
+                <span style="font-size:32px;">⏰</span>
+                <div style="flex:1;">
+                    <div style="font-weight:800;color:#E11D48;font-size:16px;margin-bottom:4px;">Your 1-Day Trial Has Ended</div>
+                    <div style="color:#94A3B8;font-size:13px;">AI Assistant and Predictive Analytics tabs are now locked.
+                    Upgrade to Pro (₹2,999/mo) or Enterprise (₹9,999/mo) to restore full access.</div>
+                </div>
             </div>
             """, unsafe_allow_html=True)
+            col_up1, col_up2, _ = st.columns([1, 1, 2])
+            with col_up1:
+                if st.button("⚡ Upgrade to Pro", use_container_width=True, key="exp_pro_btn"):
+                    st.session_state.pending_payment_plan = 'Pro'
+                    st.session_state.show_payment_page = True
+                    st.rerun()
+            with col_up2:
+                if st.button("🏆 Enterprise Plan", use_container_width=True, key="exp_ent_btn"):
+                    st.session_state.pending_payment_plan = 'Enterprise'
+                    st.session_state.show_payment_page = True
+                    st.rerun()
+
+        st.markdown("""
+        <div style="background:linear-gradient(135deg,#EFF6FF,#F0FDFA,#FFF);
+                    border:1px solid rgba(37,99,235,0.12);border-radius:22px;
+                    padding:42px 40px;margin-bottom:28px;position:relative;overflow:hidden;">
+            <div style="position:absolute;top:-60px;right:-60px;width:240px;height:240px;
+                        background:radial-gradient(circle,rgba(37,99,235,0.08),transparent 70%);
+                        border-radius:50%;pointer-events:none;"></div>
+            <div style="font-family:'Space Grotesk',sans-serif;font-size:36px;font-weight:900;color:#0F172A;margin-bottom:12px;">
+                Welcome to VigilantAP 🛡️
+            </div>
+            <div style="color:#475569;font-size:16px;line-height:1.8;max-width:680px;">
+                An advanced AI-powered food safety intelligence platform designed to monitor food adulteration,
+                identify district-level risks, track public health impact, and guide government intervention across Andhra Pradesh.
+            </div>
+            <div style="display:flex;gap:12px;margin-top:24px;flex-wrap:wrap;">
+                <div style="background:rgba(225,29,72,0.07);border:1px solid rgba(225,29,72,0.18);border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;color:#E11D48;">🔴 Live Monitoring Active</div>
+                <div style="background:rgba(5,150,105,0.07);border:1px solid rgba(5,150,105,0.18);border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;color:#059669;">✅ 26 Districts Covered</div>
+                <div style="background:rgba(217,119,6,0.07);border:1px solid rgba(217,119,6,0.18);border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;color:#D97706;">⚡ Real-time Analytics</div>
+                <div style="background:rgba(249,115,22,0.07);border:1px solid rgba(249,115,22,0.18);border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;color:#F97316;">⚡ Groq AI · LLaMA-3 70B</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        modules = [
+            ("#2563EB","#0891B2","📊","Executive Overview","High-level KPIs, risk meter, and district-wise adulteration performance at a glance."),
+            ("#7C3AED","#A78BFA","🧪","Sample Analysis","Passed vs failed food samples, monthly testing trends, and category-level contamination breakdowns."),
+            ("#E11D48","#FB7185","⚠️","Risk Analytics","Heat maps, failure trends, top high-risk districts, and AI-driven risk scoring."),
+            ("#D97706","#F59E0B","🏥","Health Impact","Disease distribution, patient count trends, seasonal analysis, and correlation insights."),
+            ("#059669","#34D399","🎯","Intervention","Priority action dashboard, government alerts, inspection coverage, and smart recommendations."),
+            ("#F97316","#FB923C","🤖","AI Assistant","Chat with Groq AI (LLaMA-3 70B) to get instant food safety insights and action plans."),
+            ("#0E7490","#06B6D4","🔮","Predictive Analytics","AI-generated forecasts, trend projections, and future risk scenario modeling."),
+            ("#DB2777","#F472B6","ℹ️","About","Platform workflow, technology stack, objectives, and future enhancement roadmap."),
+        ]
+
+        r1 = st.columns(4)
+        r2 = st.columns(4)
+        for i, (c1, c2, icon, title, desc) in enumerate(modules):
+            row = r1 if i < 4 else r2
+            with row[i % 4]:
+                st.markdown(f"""
+                <div style="background:var(--bg-card);border:1px solid rgba(0,0,0,0.07);border-radius:18px;
+                            padding:22px;margin-bottom:16px;position:relative;overflow:hidden;
+                            box-shadow:0 1px 3px rgba(0,0,0,0.05);height:180px;">
+                    <div style="position:absolute;top:0;left:0;right:0;height:3px;
+                                background:linear-gradient(90deg,{c1},{c2});border-radius:18px 18px 0 0;"></div>
+                    <div style="font-size:26px;margin-bottom:8px;">{icon}</div>
+                    <div style="font-family:'Space Grotesk',sans-serif;font-size:15px;font-weight:700;
+                                color:var(--text-primary);margin-bottom:6px;">{title}</div>
+                    <div style="font-size:12px;color:#64748B;line-height:1.5;">{desc}</div>
+                </div>
+                """, unsafe_allow_html=True)
 
 
 # =========================================================
 # EXECUTIVE OVERVIEW
 # =========================================================
 
-with tab1:
-    st.markdown("""
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:22px;">
-        <div>
-            <div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);">📊 Executive Overview</div>
-            <div style="color:#64748B;font-size:14px;margin-top:4px;">Centralized food safety performance metrics across all districts</div>
-        </div>
-        <div style="background:rgba(5,150,105,0.08);border:1px solid rgba(5,150,105,0.2);border-radius:20px;padding:6px 16px;font-size:13px;font-weight:700;color:#059669;">🟢 System Active</div>
-    </div>
-    """, unsafe_allow_html=True)
-
+def _render_executive_overview_charts(pro_filtered, pro_adulteration, pro_health_cases, pro_passed, pro_failed, pro_pass_rate, pro_total_samples):
+    """Renders all Executive Overview charts/KPIs/insights for the given filtered data."""
     k1, k2, k3, k4, k5 = st.columns(5)
-    with k1: st.markdown(kpi("🧪", "Total Samples",   f"{total_samples:,}", "Active Monitoring",    "up",   "kpi-blue"),   unsafe_allow_html=True)
-    with k2: st.markdown(kpi("✅", "Passed Samples",  f"{passed:,}",        f"{pass_rate}% pass rate","up", "kpi-green"),  unsafe_allow_html=True)
-    with k3: st.markdown(kpi("❌", "Failed Samples",  f"{failed:,}",        "Requires Action",      "down", "kpi-red"),    unsafe_allow_html=True)
-    with k4: st.markdown(kpi("🏥", "Health Cases",    f"{health_cases:,}",  "District Impact",      "warn", "kpi-amber"),  unsafe_allow_html=True)
-    with k5: st.markdown(kpi("⚠️", "Adulteration %", f"{adulteration}%",   "Risk Level",
-                              "down" if adulteration > 20 else "warn", "kpi-purple"), unsafe_allow_html=True)
+    with k1: st.markdown(kpi("🧪", "Total Samples",   f"{pro_total_samples:,}", "Active Monitoring",    "up",   "kpi-blue"),   unsafe_allow_html=True)
+    with k2: st.markdown(kpi("✅", "Passed Samples",  f"{pro_passed:,}",        f"{pro_pass_rate}% pass rate","up", "kpi-green"),  unsafe_allow_html=True)
+    with k3: st.markdown(kpi("❌", "Failed Samples",  f"{pro_failed:,}",        "Requires Action",      "down", "kpi-red"),    unsafe_allow_html=True)
+    with k4: st.markdown(kpi("🏥", "Health Cases",    f"{pro_health_cases:,}",  "District Impact",      "warn", "kpi-amber"),  unsafe_allow_html=True)
+    with k5: st.markdown(kpi("⚠️", "Adulteration %", f"{pro_adulteration}%",   "Risk Level",
+                              "down" if pro_adulteration > 20 else "warn", "kpi-purple"), unsafe_allow_html=True)
 
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
-    risk_color = "#059669" if adulteration < 10 else ("#D97706" if adulteration < 25 else "#E11D48")
-    risk_label = ("🟢 Low Risk Environment" if adulteration < 10
-                  else "🟡 Moderate Risk" if adulteration < 25
+    risk_color = "#059669" if pro_adulteration < 10 else ("#D97706" if pro_adulteration < 25 else "#E11D48")
+    risk_label = ("🟢 Low Risk Environment" if pro_adulteration < 10
+                  else "🟡 Moderate Risk" if pro_adulteration < 25
                   else "🔴 High Risk — Immediate Action Required")
     st.markdown(f"""
     <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:16px;padding:22px;margin-bottom:24px;box-shadow:0 1px 3px rgba(0,0,0,0.05);">
@@ -1254,7 +2075,7 @@ with tab1:
             <div style="font-size:14px;font-weight:700;color:{risk_color};">{risk_label}</div>
         </div>
         <div style="background:#F1F5F9;border-radius:20px;height:10px;overflow:hidden;">
-            <div style="width:{min(adulteration,100)}%;height:100%;background:linear-gradient(90deg,{risk_color},rgba(0,0,0,0.08));border-radius:20px;"></div>
+            <div style="width:{min(pro_adulteration,100)}%;height:100%;background:linear-gradient(90deg,{risk_color},rgba(0,0,0,0.08));border-radius:20px;"></div>
         </div>
         <div style="display:flex;justify-content:space-between;margin-top:8px;font-size:12px;color:#94A3B8;">
             <span>0% Safe</span><span>25% Moderate</span><span>50% High</span><span>100% Critical</span>
@@ -1265,7 +2086,7 @@ with tab1:
     c_left, c_right = st.columns([3, 2])
     with c_left:
         district_risk = (
-            filtered.groupby("DistrictName")
+            pro_filtered.groupby("DistrictName")
             .apply(lambda x: (x["TestResult"] == "Fail").mean() * 100)
             .reset_index(name="Risk %")
             .sort_values("Risk %", ascending=False)
@@ -1280,14 +2101,14 @@ with tab1:
     with c_right:
         gauge = go.Figure(go.Indicator(
             mode="gauge+number+delta",
-            value=adulteration,
+            value=pro_adulteration,
             title={"text": "Risk Meter", "font": {"color": "#0F172A", "size": 16, "family": "Space Grotesk"}},
             delta={"reference": 15, "valueformat": ".1f",
                    "increasing": {"color": "#E11D48"}, "decreasing": {"color": "#059669"}},
             number={"suffix": "%", "font": {"color": "#0F172A", "size": 52}},
             gauge={
                 "axis": {"range": [0, 100], "tickcolor": "#CBD5E1", "tickfont": {"color": "#94A3B8"}},
-                "bar": {"color": "#E11D48" if adulteration > 25 else "#D97706"},
+                "bar": {"color": "#E11D48" if pro_adulteration > 25 else "#D97706"},
                 "bgcolor": "#F1F5F9",
                 "borderwidth": 0,
                 "steps": [
@@ -1303,7 +2124,7 @@ with tab1:
 
     c2a, c2b = st.columns(2)
     with c2a:
-        category_fail = (filtered[filtered["TestResult"] == "Fail"]
+        category_fail = (pro_filtered[pro_filtered["TestResult"] == "Fail"]
                          .groupby("CategoryName").size().reset_index(name="Failures"))
         fig2 = px.pie(category_fail, names="CategoryName", values="Failures",
                       hole=0.55, title="Failed Samples by Food Category",
@@ -1312,7 +2133,7 @@ with tab1:
         st.plotly_chart(styled_chart(fig2, 420), use_container_width=True)
 
     with c2b:
-        monthly = (filtered.groupby(filtered["DateTested"].dt.to_period("M"))
+        monthly = (pro_filtered.groupby(pro_filtered["DateTested"].dt.to_period("M"))
                    .size().reset_index(name="Samples"))
         monthly["DateTested"] = monthly["DateTested"].astype(str)
         fig3 = px.area(monthly, x="DateTested", y="Samples",
@@ -1322,1212 +2143,1673 @@ with tab1:
         st.plotly_chart(styled_chart(fig3, 420), use_container_width=True)
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # Dynamic insights based on filtered data
+    top_cat_insight = (pro_filtered[pro_filtered["TestResult"] == "Fail"]
+                       .groupby("CategoryName").size().idxmax()
+                       if pro_failed > 0 else "N/A")
+    top_dist_insight = (pro_filtered[pro_filtered["TestResult"] == "Fail"]
+                        .groupby("DistrictName").size().idxmax()
+                        if pro_failed > 0 else "N/A")
+
     i1, i2, i3 = st.columns(3)
-    insights_static = [
-        ("📌 Key Insight",    "Milk, Oils and Spices show highest contamination trends consistently across monitored districts."),
-        ("🏥 Public Health",  "Failed food samples show strong positive correlation with rising public health case counts district-wide."),
-        ("🎯 Strategic Action","Authorities should immediately prioritize inspection resources in the top 5 high-risk districts."),
+    insights_dynamic = [
+        ("📌 Key Insight",    f"{'<b>' + top_cat_insight + '</b> shows' if top_cat_insight != 'N/A' else 'No'} highest contamination trend in the selected filter period."),
+        ("🏥 Public Health",  f"Failed food samples in selected scope: <b>{pro_failed:,}</b> — showing {'strong correlation' if pro_failed > 50 else 'moderate impact'} with public health case counts."),
+        ("🎯 Strategic Action", f"Focus inspection resources on <b>{top_dist_insight}</b> district and <b>{top_cat_insight}</b> category based on current filter data."),
     ]
-    for col, (title, body) in zip([i1, i2, i3], insights_static):
+    for col, (title, body) in zip([i1, i2, i3], insights_dynamic):
         with col:
             st.markdown(f'<div class="insight-box"><h4>{title}</h4><p>{body}</p></div>', unsafe_allow_html=True)
 
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
     st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;color:var(--text-primary);margin-bottom:12px;">🏆 Top High-Risk Districts</div>""", unsafe_allow_html=True)
-    st.dataframe(district_risk.head(10).style.background_gradient(subset=["Risk %"], cmap="RdYlGn_r"), use_container_width=True)
+    dr = (pro_filtered.groupby("DistrictName")
+          .apply(lambda x: (x["TestResult"] == "Fail").mean() * 100)
+          .reset_index(name="Risk %")
+          .sort_values("Risk %", ascending=False))
+    st.dataframe(dr.head(10).style.background_gradient(subset=["Risk %"], cmap="RdYlGn_r"), use_container_width=True)
+
+
+if tab1 is not None:
+    with tab1:
+        st.markdown("""
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:22px;">
+            <div>
+                <div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);">📊 Executive Overview</div>
+                <div style="color:#64748B;font-size:14px;margin-top:4px;">Centralized food safety performance metrics across all districts</div>
+            </div>
+            <div style="background:rgba(5,150,105,0.08);border:1px solid rgba(5,150,105,0.2);border-radius:20px;padding:6px 16px;font-size:13px;font-weight:700;color:#059669;">🟢 System Active</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── PRO PLAN: Show filters first, render charts only after Apply ──
+        if is_pro_plan():
+            st.markdown("""
+            <div style="background:linear-gradient(135deg,rgba(37,99,235,0.06),rgba(8,145,178,0.04));
+                        border:1px solid rgba(37,99,235,0.15);border-radius:16px;
+                        padding:18px 22px;margin-bottom:22px;">
+                <div style="font-family:'Space Grotesk',sans-serif;font-size:15px;font-weight:700;
+                            color:var(--text-primary);margin-bottom:4px;">⚡ Pro Plan — Filter-Driven Analytics</div>
+                <div style="color:#64748B;font-size:13px;">
+                    Select your filters below and click <b>Apply Filters</b> to generate charts and insights tailored to your selection.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # ── Inline filter panel ──
+            st.markdown("""
+            <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:16px;
+                        padding:22px;margin-bottom:22px;box-shadow:0 1px 3px rgba(0,0,0,0.04);">
+                <div style="font-family:'Space Grotesk',sans-serif;font-size:16px;font-weight:700;
+                            color:var(--text-primary);margin-bottom:16px;">🔍 Select Filters</div>
+            """, unsafe_allow_html=True)
+
+            pf_c1, pf_c2, pf_c3, pf_c4 = st.columns(4)
+            with pf_c1:
+                pf_month = st.selectbox(
+                    "📅 Month",
+                    sorted(samples["DateTested"].dt.strftime("%b %Y").dropna().unique()),
+                    key="pro_ov_month"
+                )
+            with pf_c2:
+                pf_district = st.selectbox(
+                    "📍 District",
+                    sorted(samples["DistrictName"].dropna().unique()),
+                    key="pro_ov_district"
+                )
+            with pf_c3:
+                pf_category = st.selectbox(
+                    "🍔 Food Category",
+                    sorted(samples["CategoryName"].dropna().unique()),
+                    key="pro_ov_category"
+                )
+            with pf_c4:
+                pf_result = st.selectbox(
+                    "🧪 Test Result",
+                    sorted(samples["TestResult"].dropna().unique()),
+                    key="pro_ov_result"
+                )
+
+            pf_row2_c1, pf_row2_c2, pf_row2_c3 = st.columns([1, 1, 2])
+            with pf_row2_c1:
+                pf_only_failed = st.checkbox("⚠️ Only Failed Samples", key="pro_ov_only_failed")
+            with pf_row2_c2:
+                pf_only_passed = st.checkbox("✅ Only Passed Samples", key="pro_ov_only_passed")
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            btn_col, reset_col, _ = st.columns([1, 1, 4])
+            with btn_col:
+                apply_clicked = st.button("▶ Apply Filters & Generate Charts", use_container_width=True, key="pro_ov_apply_btn", type="primary")
+            with reset_col:
+                reset_clicked = st.button("↺ Reset", use_container_width=True, key="pro_ov_reset_btn")
+
+            if reset_clicked:
+                st.session_state.pro_filters_applied = False
+                st.session_state.pro_tab_filters = {}
+                st.rerun()
+
+            if apply_clicked:
+                st.session_state.pro_filters_applied = True
+                st.session_state.pro_tab_filters = {
+                    "month":      pf_month,
+                    "district":   pf_district,
+                    "category":   pf_category,
+                    "result":     pf_result,
+                    "only_failed": pf_only_failed,
+                    "only_passed": pf_only_passed,
+                }
+
+            # ── Render charts only after filters applied ──
+            if st.session_state.pro_filters_applied and st.session_state.pro_tab_filters:
+                _tf = st.session_state.pro_tab_filters
+                pro_f = samples.copy()
+                pro_f = pro_f[pro_f["DateTested"].dt.strftime("%b %Y") == _tf["month"]]
+                pro_f = pro_f[pro_f["DistrictName"] == _tf["district"]]
+                pro_f = pro_f[pro_f["CategoryName"] == _tf["category"]]
+                pro_f = pro_f[pro_f["TestResult"] == _tf["result"]]
+                if _tf["only_failed"]: pro_f = pro_f[pro_f["TestResult"] == "Fail"]
+                if _tf["only_passed"]: pro_f = pro_f[pro_f["TestResult"] == "Pass"]
+
+                pro_fh = health.copy()
+                if _tf["district"] != "All Districts":
+                    pro_fh = pro_fh[pro_fh["DistrictName"] == _tf["district"]]
+
+                _pro_total  = len(pro_f)
+                _pro_failed = len(pro_f[pro_f["TestResult"] == "Fail"])
+                _pro_passed = len(pro_f[pro_f["TestResult"] == "Pass"])
+                _pro_adult  = round((_pro_failed / _pro_total) * 100, 2) if _pro_total > 0 else 0
+                _pro_hcases = int(pro_fh["PatientCount"].sum())
+                _pro_prate  = round((_pro_passed / _pro_total) * 100, 1) if _pro_total > 0 else 0
+
+                # Show active filter summary badge
+                st.markdown(f"""
+                <div style="background:rgba(37,99,235,0.06);border:1px solid rgba(37,99,235,0.18);
+                            border-radius:10px;padding:10px 16px;margin-bottom:18px;
+                            display:flex;align-items:center;gap:10px;">
+                    <span style="font-size:13px;font-weight:700;color:#2563EB;">✅ Showing results for {_pro_total:,} records</span>
+                    <span style="font-size:12px;color:#64748B;">· Filtered by: {_tf['month']} · {_tf['district']} · {_tf['category']} · {_tf['result']}</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+                _render_executive_overview_charts(pro_f, _pro_adult, _pro_hcases, _pro_passed, _pro_failed, _pro_prate, _pro_total)
+            else:
+                # Placeholder when no filters applied yet
+                st.markdown("""
+                <div style="background:var(--bg-card);border:2px dashed var(--border-md);border-radius:18px;
+                            padding:60px 40px;text-align:center;margin-top:8px;">
+                    <div style="font-size:48px;margin-bottom:16px;">📊</div>
+                    <div style="font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:700;
+                                color:var(--text-primary);margin-bottom:8px;">Select Filters to View Analytics</div>
+                    <div style="color:#94A3B8;font-size:14px;max-width:460px;margin:0 auto;line-height:1.6;">
+                        Use the filters above to select a month, district, food category, or test result,
+                        then click <strong>Apply Filters &amp; Generate Charts</strong> to view your personalised insights.
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # ── ENTERPRISE / ORG / ADMIN: Show all charts immediately (unchanged) ──
+        else:
+            _render_executive_overview_charts(filtered, adulteration, health_cases, passed, failed, pass_rate, total_samples)
 
 
 # =========================================================
 # SAMPLE ANALYSIS
 # =========================================================
 
-with tab2:
-    st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);margin-bottom:6px;">🧪 Sample Analysis</div>
-    <div style="color:#64748B;font-size:14px;margin-bottom:22px;">Laboratory testing results, trends and food category-level quality breakdown</div>""", unsafe_allow_html=True)
+if tab2 is not None:
+    with tab2:
+        st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);margin-bottom:6px;">🧪 Sample Analysis</div>
+        <div style="color:#64748B;font-size:14px;margin-bottom:22px;">Laboratory testing results, trends and food category-level quality breakdown</div>""", unsafe_allow_html=True)
 
-    s1, s2, s3, s4 = st.columns(4)
-    with s1: st.markdown(kpi("🧪", "Total Samples Tested", f"{total_samples:,}", "All selected filters",      "up",   "kpi-cyan"),  unsafe_allow_html=True)
-    with s2: st.markdown(kpi("✅", "Samples Passed",        f"{passed:,}",        f"{pass_rate}% pass rate",  "up",   "kpi-green"), unsafe_allow_html=True)
-    with s3: st.markdown(kpi("❌", "Samples Failed",        f"{failed:,}",        "Requires investigation",   "down", "kpi-red"),   unsafe_allow_html=True)
-    with s4: st.markdown(kpi("🍽️","Top Risk Category",     top_risk_cat,         "Highest failures",          "warn", "kpi-amber"), unsafe_allow_html=True)
+        s1, s2, s3, s4 = st.columns(4)
+        with s1: st.markdown(kpi("🧪", "Total Samples Tested", f"{total_samples:,}", "All selected filters",      "up",   "kpi-cyan"),  unsafe_allow_html=True)
+        with s2: st.markdown(kpi("✅", "Samples Passed",        f"{passed:,}",        f"{pass_rate}% pass rate",  "up",   "kpi-green"), unsafe_allow_html=True)
+        with s3: st.markdown(kpi("❌", "Samples Failed",        f"{failed:,}",        "Requires investigation",   "down", "kpi-red"),   unsafe_allow_html=True)
+        with s4: st.markdown(kpi("🍽️","Top Risk Category",     top_risk_cat,         "Highest failures",          "warn", "kpi-amber"), unsafe_allow_html=True)
 
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-    t2c1, t2c2 = st.columns(2)
-    with t2c1:
-        monthly_s = filtered.groupby(filtered["DateTested"].dt.to_period("M")).size().reset_index(name="Samples")
-        monthly_s["DateTested"] = monthly_s["DateTested"].astype(str)
-        fig_s1 = px.area(monthly_s, x="DateTested", y="Samples", title="Monthly Sample Testing Volume", color_discrete_sequence=["#0891B2"])
-        fig_s1.update_traces(fillcolor="rgba(8,145,178,0.08)", line_width=2)
-        st.plotly_chart(styled_chart(fig_s1), use_container_width=True)
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        t2c1, t2c2 = st.columns(2)
+        with t2c1:
+            monthly_s = filtered.groupby(filtered["DateTested"].dt.to_period("M")).size().reset_index(name="Samples")
+            monthly_s["DateTested"] = monthly_s["DateTested"].astype(str)
+            fig_s1 = px.area(monthly_s, x="DateTested", y="Samples", title="Monthly Sample Testing Volume", color_discrete_sequence=["#0891B2"])
+            fig_s1.update_traces(fillcolor="rgba(8,145,178,0.08)", line_width=2)
+            st.plotly_chart(styled_chart(fig_s1), use_container_width=True)
 
-    with t2c2:
-        fig_pie = px.pie(names=["Passed", "Failed"], values=[passed, failed], hole=0.55,
-                          title="Pass vs Fail Distribution", color_discrete_sequence=["#059669", "#E11D48"])
-        fig_pie.update_traces(marker=dict(line=dict(color="#FFFFFF", width=2)))
-        st.plotly_chart(styled_chart(fig_pie), use_container_width=True)
+        with t2c2:
+            fig_pie = px.pie(names=["Passed", "Failed"], values=[passed, failed], hole=0.55,
+                              title="Pass vs Fail Distribution", color_discrete_sequence=["#059669", "#E11D48"])
+            fig_pie.update_traces(marker=dict(line=dict(color="#FFFFFF", width=2)))
+            st.plotly_chart(styled_chart(fig_pie), use_container_width=True)
 
-    monthly_pf = filtered.groupby([filtered["DateTested"].dt.to_period("M"), "TestResult"]).size().reset_index(name="Count")
-    monthly_pf["DateTested"] = monthly_pf["DateTested"].astype(str)
-    fig_pf = px.bar(monthly_pf, x="DateTested", y="Count", color="TestResult",
-                    title="Monthly Pass vs Fail Breakdown", barmode="stack",
-                    color_discrete_map={"Pass": "#059669", "Fail": "#E11D48"})
-    fig_pf.update_traces(marker_line_width=0)
-    st.plotly_chart(styled_chart(fig_pf, 380), use_container_width=True)
+        monthly_pf = filtered.groupby([filtered["DateTested"].dt.to_period("M"), "TestResult"]).size().reset_index(name="Count")
+        monthly_pf["DateTested"] = monthly_pf["DateTested"].astype(str)
+        fig_pf = px.bar(monthly_pf, x="DateTested", y="Count", color="TestResult",
+                        title="Monthly Pass vs Fail Breakdown", barmode="stack",
+                        color_discrete_map={"Pass": "#059669", "Fail": "#E11D48"})
+        fig_pf.update_traces(marker_line_width=0)
+        st.plotly_chart(styled_chart(fig_pf, 380), use_container_width=True)
 
-    cat_pf = filtered.groupby(["CategoryName", "TestResult"]).size().reset_index(name="Count")
-    fig_cat = px.bar(cat_pf, x="CategoryName", y="Count", color="TestResult",
-                     title="Category-wise Pass vs Fail", barmode="group",
-                     color_discrete_map={"Pass": "#059669", "Fail": "#E11D48"})
-    fig_cat.update_traces(marker_line_width=0)
-    st.plotly_chart(styled_chart(fig_cat, 380), use_container_width=True)
+        cat_pf = filtered.groupby(["CategoryName", "TestResult"]).size().reset_index(name="Count")
+        fig_cat = px.bar(cat_pf, x="CategoryName", y="Count", color="TestResult",
+                         title="Category-wise Pass vs Fail", barmode="group",
+                         color_discrete_map={"Pass": "#059669", "Fail": "#E11D48"})
+        fig_cat.update_traces(marker_line_width=0)
+        st.plotly_chart(styled_chart(fig_cat, 380), use_container_width=True)
 
 
 # =========================================================
 # RISK ANALYTICS
 # =========================================================
 
-with tab3:
-    st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);margin-bottom:6px;">⚠️ Risk Analytics</div>
-    <div style="color:#64748B;font-size:14px;margin-bottom:22px;">District risk scores, failure trends, category hotspots and AI-powered risk predictions</div>""", unsafe_allow_html=True)
+if tab3 is not None:
+    with tab3:
+        st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);margin-bottom:6px;">⚠️ Risk Analytics</div>
+        <div style="color:#64748B;font-size:14px;margin-bottom:22px;">District risk scores, failure trends, category hotspots and AI-powered risk predictions</div>""", unsafe_allow_html=True)
 
-    r1c, r2c, r3c, r4c = st.columns(4)
-    with r1c: st.markdown(kpi("🔥", "Overall Risk Score",    "65.3", "↑ +12% this month",    "warn", "kpi-amber"), unsafe_allow_html=True)
-    with r2c: st.markdown(kpi("🚨", "High Risk Districts",   "5",    "↑ +2 new alerts",       "down", "kpi-red"),   unsafe_allow_html=True)
-    with r3c: st.markdown(kpi("📋", "Inspection Coverage",   "78%",  "↑ +8% improvement",    "up",   "kpi-blue"),  unsafe_allow_html=True)
-    with r4c: st.markdown(kpi("📈", "Compliance Rate",       "67%",  "↑ +3% vs last month",  "up",   "kpi-teal"),  unsafe_allow_html=True)
+        r1c, r2c, r3c, r4c = st.columns(4)
+        with r1c: st.markdown(kpi("🔥", "Overall Risk Score",    "65.3", "↑ +12% this month",    "warn", "kpi-amber"), unsafe_allow_html=True)
+        with r2c: st.markdown(kpi("🚨", "High Risk Districts",   "5",    "↑ +2 new alerts",       "down", "kpi-red"),   unsafe_allow_html=True)
+        with r3c: st.markdown(kpi("📋", "Inspection Coverage",   "78%",  "↑ +8% improvement",    "up",   "kpi-blue"),  unsafe_allow_html=True)
+        with r4c: st.markdown(kpi("📈", "Compliance Rate",       "67%",  "↑ +3% vs last month",  "up",   "kpi-teal"),  unsafe_allow_html=True)
 
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-    ra1, ra2 = st.columns(2)
-    with ra1:
-        category_fail = (filtered[filtered["TestResult"] == "Fail"]
-                         .groupby("CategoryName").size().reset_index(name="Failures")
-                         .sort_values("Failures", ascending=False))
-        fig5 = px.bar(category_fail, x="CategoryName", y="Failures", color="Failures",
-                      title="Failures by Food Category", color_continuous_scale=DIVERGING_SCALE)
-        fig5.update_traces(marker_line_width=0)
-        st.plotly_chart(styled_chart(fig5), use_container_width=True)
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        ra1, ra2 = st.columns(2)
+        with ra1:
+            category_fail = (filtered[filtered["TestResult"] == "Fail"]
+                             .groupby("CategoryName").size().reset_index(name="Failures")
+                             .sort_values("Failures", ascending=False))
+            fig5 = px.bar(category_fail, x="CategoryName", y="Failures", color="Failures",
+                          title="Failures by Food Category", color_continuous_scale=DIVERGING_SCALE)
+            fig5.update_traces(marker_line_width=0)
+            st.plotly_chart(styled_chart(fig5), use_container_width=True)
 
-    with ra2:
-        risk_districts = pd.DataFrame({
-            "District":    ["Tirupati","Chittoor","Vizag","Kurnool","Anantapur","Nellore","Kadapa","Guntur"],
-            "Risk Score":  [89, 76, 72, 68, 61, 58, 52, 47]
-        })
-        fig_top = px.bar(risk_districts, x="Risk Score", y="District", orientation="h", color="Risk Score",
-                         title="Top High-Risk Districts — Risk Score",
-                         color_continuous_scale=DIVERGING_SCALE)
-        fig_top.update_traces(marker_line_width=0)
-        fig_top.update_layout(yaxis=dict(autorange="reversed"))
-        st.plotly_chart(styled_chart(fig_top), use_container_width=True)
+        with ra2:
+            risk_districts = pd.DataFrame({
+                "District":    ["Tirupati","Chittoor","Vizag","Kurnool","Anantapur","Nellore","Kadapa","Guntur"],
+                "Risk Score":  [89, 76, 72, 68, 61, 58, 52, 47]
+            })
+            fig_top = px.bar(risk_districts, x="Risk Score", y="District", orientation="h", color="Risk Score",
+                             title="Top High-Risk Districts — Risk Score",
+                             color_continuous_scale=DIVERGING_SCALE)
+            fig_top.update_traces(marker_line_width=0)
+            fig_top.update_layout(yaxis=dict(autorange="reversed"))
+            st.plotly_chart(styled_chart(fig_top), use_container_width=True)
 
-    trend_data = pd.DataFrame({"Month":["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug"],"Risk Score":[45,52,48,61,70,65,72,68],"Threshold":[50]*8})
-    fig_trend = px.line(trend_data, x="Month", y=["Risk Score","Threshold"], markers=True, title="Monthly Risk Score Trend",
-                        color_discrete_map={"Risk Score":"#E11D48","Threshold":"#D97706"})
-    fig_trend.update_traces(line_width=2.5)
-    st.plotly_chart(styled_chart(fig_trend, 360), use_container_width=True)
+        trend_data = pd.DataFrame({"Month":["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug"],"Risk Score":[45,52,48,61,70,65,72,68],"Threshold":[50]*8})
+        fig_trend = px.line(trend_data, x="Month", y=["Risk Score","Threshold"], markers=True, title="Monthly Risk Score Trend",
+                            color_discrete_map={"Risk Score":"#E11D48","Threshold":"#D97706"})
+        fig_trend.update_traces(line_width=2.5)
+        st.plotly_chart(styled_chart(fig_trend, 360), use_container_width=True)
 
-    heatmap_data = (filtered[filtered["TestResult"] == "Fail"]
-                    .groupby(["DistrictName","CategoryName"]).size().reset_index(name="Failures"))
-    if not heatmap_data.empty:
-        pivot = heatmap_data.pivot_table(index="CategoryName", columns="DistrictName", values="Failures", fill_value=0)
-        fig_heat = px.imshow(pivot, title="Risk Heatmap — Category × District",
-                             color_continuous_scale="RdYlGn_r", aspect="auto", text_auto=True)
-        fig_heat.update_layout(**get_chart_layout(), height=400)
-        st.plotly_chart(fig_heat, use_container_width=True)
+        heatmap_data = (filtered[filtered["TestResult"] == "Fail"]
+                        .groupby(["DistrictName","CategoryName"]).size().reset_index(name="Failures"))
+        if not heatmap_data.empty:
+            pivot = heatmap_data.pivot_table(index="CategoryName", columns="DistrictName", values="Failures", fill_value=0)
+            fig_heat = px.imshow(pivot, title="Risk Heatmap — Category × District",
+                                 color_continuous_scale="RdYlGn_r", aspect="auto", text_auto=True)
+            fig_heat.update_layout(**get_chart_layout(), height=400)
+            st.plotly_chart(fig_heat, use_container_width=True)
 
 
 # =========================================================
 # HEALTH IMPACT
 # =========================================================
 
-with tab4:
-    st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);margin-bottom:6px;">🏥 Health Impact</div>
-    <div style="color:#64748B;font-size:14px;margin-bottom:22px;">Disease distribution, patient trends, seasonal analysis, and failed-sample health correlations</div>""", unsafe_allow_html=True)
+if tab4 is not None:
+    with tab4:
+        st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);margin-bottom:6px;">🏥 Health Impact</div>
+        <div style="color:#64748B;font-size:14px;margin-bottom:22px;">Disease distribution, patient trends, seasonal analysis, and failed-sample health correlations</div>""", unsafe_allow_html=True)
 
-    h1c, h2c, h3c, h4c = st.columns(4)
-    with h1c: st.markdown(kpi("🏥", "Total Health Cases",    f"{health_cases:,}", "↑ +12% vs prior period", "down", "kpi-red"),    unsafe_allow_html=True)
-    with h2c: st.markdown(kpi("📍", "Highest Risk District", "Tirupati",          "Immediate attention",    "down", "kpi-rose"),   unsafe_allow_html=True)
-    with h3c: st.markdown(kpi("🥛", "Top Risk Category",     "Milk & Oils",       "Weekly monitoring",     "warn", "kpi-purple"), unsafe_allow_html=True)
-    with h4c: st.markdown(kpi("🚑", "Alert Level",           "HIGH",              "Emergency active",       "down", "kpi-amber"),  unsafe_allow_html=True)
+        h1c, h2c, h3c, h4c = st.columns(4)
+        with h1c: st.markdown(kpi("🏥", "Total Health Cases",    f"{health_cases:,}", "↑ +12% vs prior period", "down", "kpi-red"),    unsafe_allow_html=True)
+        with h2c: st.markdown(kpi("📍", "Highest Risk District", "Tirupati",          "Immediate attention",    "down", "kpi-rose"),   unsafe_allow_html=True)
+        with h3c: st.markdown(kpi("🥛", "Top Risk Category",     "Milk & Oils",       "Weekly monitoring",     "warn", "kpi-purple"), unsafe_allow_html=True)
+        with h4c: st.markdown(kpi("🚑", "Alert Level",           "HIGH",              "Emergency active",       "down", "kpi-amber"),  unsafe_allow_html=True)
 
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.error("🚨 Alert: Tirupati showing sudden spike in food poisoning cases — Deploy inspection teams immediately")
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        st.error("🚨 Alert: Tirupati showing sudden spike in food poisoning cases — Deploy inspection teams immediately")
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
-    monthly_failed = (filtered[filtered["TestResult"] == "Fail"]
-                      .groupby(filtered["DateTested"].dt.to_period("M")).size().reset_index(name="Failed"))
-    monthly_failed["DateTested"] = monthly_failed["DateTested"].astype(str)
-    monthly_health = (filtered_health.groupby(filtered_health["Date"].dt.to_period("M"))["PatientCount"]
-                      .sum().reset_index())
-    monthly_health["Date"] = monthly_health["Date"].astype(str)
+        monthly_failed = (filtered[filtered["TestResult"] == "Fail"]
+                          .groupby(filtered["DateTested"].dt.to_period("M")).size().reset_index(name="Failed"))
+        monthly_failed["DateTested"] = monthly_failed["DateTested"].astype(str)
+        monthly_health = (filtered_health.groupby(filtered_health["Date"].dt.to_period("M"))["PatientCount"]
+                          .sum().reset_index())
+        monthly_health["Date"] = monthly_health["Date"].astype(str)
 
-    fig6 = make_subplots(specs=[[{"secondary_y": True}]])
-    fig6.add_trace(go.Bar(x=monthly_failed["DateTested"], y=monthly_failed["Failed"],
-                          name="Failed Samples", marker_color="#E11D48", marker_line_width=0, opacity=0.8), secondary_y=False)
-    fig6.add_trace(go.Scatter(x=monthly_health["Date"], y=monthly_health["PatientCount"],
-                              mode="lines+markers", name="Patient Count",
-                              line=dict(color="#0891B2", width=2.5), marker=dict(size=7, color="#0891B2")), secondary_y=True)
-    fig6.update_layout(**get_chart_layout(), height=400, title_text="Failed Samples vs Patient Count Correlation")
-    fig6.update_yaxes(title_text="Failed Samples", secondary_y=False, title_font=dict(color="#E11D48"))
-    fig6.update_yaxes(title_text="Patient Count",  secondary_y=True,  title_font=dict(color="#0891B2"))
-    st.plotly_chart(fig6, use_container_width=True)
+        fig6 = make_subplots(specs=[[{"secondary_y": True}]])
+        fig6.add_trace(go.Bar(x=monthly_failed["DateTested"], y=monthly_failed["Failed"],
+                              name="Failed Samples", marker_color="#E11D48", marker_line_width=0, opacity=0.8), secondary_y=False)
+        fig6.add_trace(go.Scatter(x=monthly_health["Date"], y=monthly_health["PatientCount"],
+                                  mode="lines+markers", name="Patient Count",
+                                  line=dict(color="#0891B2", width=2.5), marker=dict(size=7, color="#0891B2")), secondary_y=True)
+        fig6.update_layout(**get_chart_layout(), height=400, title_text="Failed Samples vs Patient Count Correlation")
+        fig6.update_yaxes(title_text="Failed Samples", secondary_y=False, title_font=dict(color="#E11D48"))
+        fig6.update_yaxes(title_text="Patient Count",  secondary_y=True,  title_font=dict(color="#0891B2"))
+        st.plotly_chart(fig6, use_container_width=True)
 
-    h4a, h4b = st.columns(2)
-    with h4a:
-        disease_df = pd.DataFrame({"Disease":["Food Poisoning","Stomach Infection","Allergy","Water Contamination","Others"],"Cases":[45,30,15,20,10]})
-        fig_dis = px.pie(disease_df, names="Disease", values="Cases", hole=0.55, title="Disease Distribution",
-                          color_discrete_sequence=["#E11D48","#D97706","#059669","#2563EB","#7C3AED"])
-        fig_dis.update_traces(textinfo="percent+label", marker=dict(line=dict(color="#FFFFFF", width=2)))
-        st.plotly_chart(styled_chart(fig_dis), use_container_width=True)
+        h4a, h4b = st.columns(2)
+        with h4a:
+            disease_df = pd.DataFrame({"Disease":["Food Poisoning","Stomach Infection","Allergy","Water Contamination","Others"],"Cases":[45,30,15,20,10]})
+            fig_dis = px.pie(disease_df, names="Disease", values="Cases", hole=0.55, title="Disease Distribution",
+                              color_discrete_sequence=["#E11D48","#D97706","#059669","#2563EB","#7C3AED"])
+            fig_dis.update_traces(textinfo="percent+label", marker=dict(line=dict(color="#FFFFFF", width=2)))
+            st.plotly_chart(styled_chart(fig_dis), use_container_width=True)
 
-    with h4b:
-        season_df = pd.DataFrame({"Season":["Summer","Rainy","Winter"],"Risk":[90,75,45]})
-        fig_season = px.bar(season_df, x="Season", y="Risk", color="Risk", title="Seasonal Risk Analysis",
-                             color_continuous_scale=DIVERGING_SCALE, text_auto=True)
-        fig_season.update_traces(marker_line_width=0, textfont_color="white")
-        st.plotly_chart(styled_chart(fig_season), use_container_width=True)
+        with h4b:
+            season_df = pd.DataFrame({"Season":["Summer","Rainy","Winter"],"Risk":[90,75,45]})
+            fig_season = px.bar(season_df, x="Season", y="Risk", color="Risk", title="Seasonal Risk Analysis",
+                                 color_continuous_scale=DIVERGING_SCALE, text_auto=True)
+            fig_season.update_traces(marker_line_width=0, textfont_color="white")
+            st.plotly_chart(styled_chart(fig_season), use_container_width=True)
 
 
 # =========================================================
 # INTERVENTION
 # =========================================================
 
-with tab5:
-    st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);margin-bottom:6px;">🎯 Intervention Dashboard</div>
-    <div style="color:#64748B;font-size:14px;margin-bottom:22px;">Government action priorities, inspection progress, alerts and AI-driven strategy recommendations</div>""", unsafe_allow_html=True)
+if tab5 is not None:
+    with tab5:
+        st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);margin-bottom:6px;">🎯 Intervention Dashboard</div>
+        <div style="color:#64748B;font-size:14px;margin-bottom:22px;">Government action priorities, inspection progress, alerts and AI-driven strategy recommendations</div>""", unsafe_allow_html=True)
 
-    iv1, iv2, iv3, iv4 = st.columns(4)
-    with iv1: st.markdown(kpi("🎯","Intervention Target","78%","↑ +5% this month",         "up",   "kpi-blue"),   unsafe_allow_html=True)
-    with iv2: st.markdown(kpi("🚨","Critical Alerts",   "3",  "Requires immediate action", "down", "kpi-red"),    unsafe_allow_html=True)
-    with iv3: st.markdown(kpi("🔍","Active Inspections","142","Ongoing district checks",   "up",   "kpi-green"),  unsafe_allow_html=True)
-    with iv4: st.markdown(kpi("📋","Actions Completed", "67%","↑ of planned interventions","up",   "kpi-purple"), unsafe_allow_html=True)
+        iv1, iv2, iv3, iv4 = st.columns(4)
+        with iv1: st.markdown(kpi("🎯","Intervention Target","78%","↑ +5% this month",         "up",   "kpi-blue"),   unsafe_allow_html=True)
+        with iv2: st.markdown(kpi("🚨","Critical Alerts",   "3",  "Requires immediate action", "down", "kpi-red"),    unsafe_allow_html=True)
+        with iv3: st.markdown(kpi("🔍","Active Inspections","142","Ongoing district checks",   "up",   "kpi-green"),  unsafe_allow_html=True)
+        with iv4: st.markdown(kpi("📋","Actions Completed", "67%","↑ of planned interventions","up",   "kpi-purple"), unsafe_allow_html=True)
 
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-    ac1, ac2, ac3 = st.columns(3)
-    with ac1:
-        st.markdown("""<div style="background:#FFF1F2;border:1px solid rgba(225,29,72,0.2);border-radius:14px;padding:18px;border-left:4px solid #E11D48;">
-            <div style="font-size:13px;font-weight:700;color:#E11D48;margin-bottom:6px;">🔴 CRITICAL</div>
-            <div style="font-size:15px;font-weight:700;color:#0F172A;">Tirupati</div>
-            <div style="font-size:13px;color:#64748B;margin-top:4px;">Immediate inspection deployment required</div>
-        </div>""", unsafe_allow_html=True)
-    with ac2:
-        st.markdown("""<div style="background:#FFFBEB;border:1px solid rgba(217,119,6,0.2);border-radius:14px;padding:18px;border-left:4px solid #D97706;">
-            <div style="font-size:13px;font-weight:700;color:#D97706;margin-bottom:6px;">🟠 MEDIUM RISK</div>
-            <div style="font-size:15px;font-weight:700;color:#0F172A;">SPSR Nellore</div>
-            <div style="font-size:13px;color:#64748B;margin-top:4px;">Increased monitoring scheduled</div>
-        </div>""", unsafe_allow_html=True)
-    with ac3:
-        st.markdown("""<div style="background:#F0FDF4;border:1px solid rgba(5,150,105,0.2);border-radius:14px;padding:18px;border-left:4px solid #059669;">
-            <div style="font-size:13px;font-weight:700;color:#059669;margin-bottom:6px;">🟢 CONTROLLED</div>
-            <div style="font-size:15px;font-weight:700;color:#0F172A;">Vizianagaram</div>
-            <div style="font-size:13px;color:#64748B;margin-top:4px;">Routine inspections ongoing</div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        ac1, ac2, ac3 = st.columns(3)
+        with ac1:
+            st.markdown("""<div style="background:#FFF1F2;border:1px solid rgba(225,29,72,0.2);border-radius:14px;padding:18px;border-left:4px solid #E11D48;">
+                <div style="font-size:13px;font-weight:700;color:#E11D48;margin-bottom:6px;">🔴 CRITICAL</div>
+                <div style="font-size:15px;font-weight:700;color:#0F172A;">Tirupati</div>
+                <div style="font-size:13px;color:#64748B;margin-top:4px;">Immediate inspection deployment required</div>
+            </div>""", unsafe_allow_html=True)
+        with ac2:
+            st.markdown("""<div style="background:#FFFBEB;border:1px solid rgba(217,119,6,0.2);border-radius:14px;padding:18px;border-left:4px solid #D97706;">
+                <div style="font-size:13px;font-weight:700;color:#D97706;margin-bottom:6px;">🟠 MEDIUM RISK</div>
+                <div style="font-size:15px;font-weight:700;color:#0F172A;">SPSR Nellore</div>
+                <div style="font-size:13px;color:#64748B;margin-top:4px;">Increased monitoring scheduled</div>
+            </div>""", unsafe_allow_html=True)
+        with ac3:
+            st.markdown("""<div style="background:#F0FDF4;border:1px solid rgba(5,150,105,0.2);border-radius:14px;padding:18px;border-left:4px solid #059669;">
+                <div style="font-size:13px;font-weight:700;color:#059669;margin-bottom:6px;">🟢 CONTROLLED</div>
+                <div style="font-size:15px;font-weight:700;color:#0F172A;">Vizianagaram</div>
+                <div style="font-size:13px;color:#64748B;margin-top:4px;">Routine inspections ongoing</div>
+            </div>""", unsafe_allow_html=True)
 
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-    iv_c1, iv_c2 = st.columns(2)
-    with iv_c1:
-        priority = (filtered[filtered["TestResult"] == "Fail"]
-                    .groupby("DistrictName").size().reset_index(name="Failure Count")
-                    .sort_values("Failure Count", ascending=False).head(10))
-        fig_iv1 = px.bar(priority, x="DistrictName", y="Failure Count", color="Failure Count",
-                          title="Top Districts — Failure Count", color_continuous_scale=DIVERGING_SCALE)
-        fig_iv1.update_traces(marker_line_width=0)
-        st.plotly_chart(styled_chart(fig_iv1), use_container_width=True)
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        iv_c1, iv_c2 = st.columns(2)
+        with iv_c1:
+            priority = (filtered[filtered["TestResult"] == "Fail"]
+                        .groupby("DistrictName").size().reset_index(name="Failure Count")
+                        .sort_values("Failure Count", ascending=False).head(10))
+            fig_iv1 = px.bar(priority, x="DistrictName", y="Failure Count", color="Failure Count",
+                              title="Top Districts — Failure Count", color_continuous_scale=DIVERGING_SCALE)
+            fig_iv1.update_traces(marker_line_width=0)
+            st.plotly_chart(styled_chart(fig_iv1), use_container_width=True)
 
-    with iv_c2:
-        insp_data = pd.DataFrame({
-            "District":         ["Tirupati","Chittoor","Vizag","Kurnool","Nellore","Anantapur","Kadapa","Guntur"],
-            "Inspections Done": [45, 38, 52, 30, 27, 22, 18, 35],
-            "Target":           [60, 50, 60, 40, 35, 30, 25, 45]
-        })
-        fig_insp = go.Figure()
-        fig_insp.add_trace(go.Bar(name="Inspections Done", x=insp_data["District"], y=insp_data["Inspections Done"], marker_color="#2563EB", marker_line_width=0))
-        fig_insp.add_trace(go.Bar(name="Target",           x=insp_data["District"], y=insp_data["Target"],           marker_color="rgba(37,99,235,0.18)", marker_line_width=0))
-        fig_insp.update_layout(**get_chart_layout(), height=420, title_text="Inspection Progress vs Target", barmode="overlay")
-        st.plotly_chart(fig_insp, use_container_width=True)
+        with iv_c2:
+            insp_data = pd.DataFrame({
+                "District":         ["Tirupati","Chittoor","Vizag","Kurnool","Nellore","Anantapur","Kadapa","Guntur"],
+                "Inspections Done": [45, 38, 52, 30, 27, 22, 18, 35],
+                "Target":           [60, 50, 60, 40, 35, 30, 25, 45]
+            })
+            fig_insp = go.Figure()
+            fig_insp.add_trace(go.Bar(name="Inspections Done", x=insp_data["District"], y=insp_data["Inspections Done"], marker_color="#2563EB", marker_line_width=0))
+            fig_insp.add_trace(go.Bar(name="Target",           x=insp_data["District"], y=insp_data["Target"],           marker_color="rgba(37,99,235,0.18)", marker_line_width=0))
+            fig_insp.update_layout(**get_chart_layout(), height=420, title_text="Inspection Progress vs Target", barmode="overlay")
+            st.plotly_chart(fig_insp, use_container_width=True)
 
-    st.dataframe(priority.style.background_gradient(subset=["Failure Count"], cmap="RdYlGn_r"), use_container_width=True)
+        st.dataframe(priority.style.background_gradient(subset=["Failure Count"], cmap="RdYlGn_r"), use_container_width=True)
 
 
 # =========================================================
 # 🤖 AI ASSISTANT TAB
 # =========================================================
 
-with tab_ai:
-    st.markdown("""
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-        <div>
-            <div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);">🤖 AI Food Safety Assistant</div>
-            <div style="color:#64748B;font-size:14px;margin-top:4px;">Powered by Groq AI (LLaMA-3 70B) — live intelligence briefing and interactive Q&amp;A</div>
-        </div>
-        <div class="live-tag"><span class="live-dot"></span> LIVE ANALYSIS</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    ai1, ai2, ai3 = st.columns(3)
-    with ai1: st.markdown(kpi("⚡", "AI Engine",    "Groq · LLaMA-3",  "Ultra-fast inference",      "up", "kpi-amber"),  unsafe_allow_html=True)
-    with ai2: st.markdown(kpi("💬", "Responses",    "Real-time",        "Context-aware answers",     "up", "kpi-blue"),   unsafe_allow_html=True)
-    with ai3: st.markdown(kpi("🎯", "Accuracy",     "98%",              "Data-grounded insights",    "up", "kpi-green"),  unsafe_allow_html=True)
-
-    st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
-
-    # Build context summary
-    context_summary = f"""
-    - Total samples tested: {total_samples:,}
-    - Passed: {passed:,} ({pass_rate}% pass rate) | Failed: {failed:,}
-    - Overall adulteration rate: {adulteration}%
-    - Total health cases recorded: {health_cases:,}
-    - Top failure category: {top_risk_cat} ({top_cat_rate}% fail rate)
-    - Top failure district: {top_risk_dist}
-    - Top 5 high-risk districts by fail rate: {', '.join([f"{d} ({r}%)" for d, r in zip(top5_districts[:5], top5_rates[:5])])}
-    - Active filter — Month: {month_filter}, District: {district_filter}, Category: {category_filter}
-    - Current risk level: {"Critical" if adulteration > 35 else "High" if adulteration > 25 else "Moderate" if adulteration > 10 else "Low"}
-    - Inspections data: High Risk violations dominate, Street Vendors most cited
-    """
-
-    # ── SECTION 1: Static Data Blocks ──
-    st.markdown("""
-    <div style="font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:700;
-                color:var(--text-primary);margin-bottom:4px;">📊 Data Intelligence Blocks</div>
-    <div style="color:#64748B;font-size:13px;margin-bottom:16px;">Derived directly from your filtered dataset</div>
-    """, unsafe_allow_html=True)
-
-    gc1, gc2, gc3, gc4 = st.columns(4)
-
-    risk_badge_color = "#E11D48" if adulteration > 25 else "#D97706" if adulteration > 10 else "#059669"
-    risk_badge_bg    = "rgba(225,29,72,0.08)" if adulteration > 25 else "rgba(217,119,6,0.08)" if adulteration > 10 else "rgba(5,150,105,0.08)"
-    risk_badge_label = "Critical Risk" if adulteration > 35 else "High Risk" if adulteration > 25 else "Moderate Risk" if adulteration > 10 else "Safe Zone"
-
-    with gc1:
-        st.markdown(f"""
-        <div class="ai-grid-card">
-            <div class="ai-grid-card-accent" style="background:linear-gradient(90deg,#E11D48,#F43F5E);"></div>
-            <div class="ai-grid-card-number" style="color:#E11D48;">{adulteration}%</div>
-            <div class="ai-grid-card-label">Adulteration Rate</div>
-            <div class="ai-grid-card-desc">Overall proportion of food samples failing quality tests across all monitored categories.</div>
-            <div class="ai-grid-card-badge" style="background:{risk_badge_bg};color:{risk_badge_color};border:1px solid {risk_badge_color}22;">{risk_badge_label}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with gc2:
-        above_below = "Above Target ✓" if pass_rate > 75 else "Below Target ↓"
-        st.markdown(f"""
-        <div class="ai-grid-card">
-            <div class="ai-grid-card-accent" style="background:linear-gradient(90deg,#2563EB,#0891B2);"></div>
-            <div class="ai-grid-card-number" style="color:#2563EB;">{pass_rate}%</div>
-            <div class="ai-grid-card-label">Compliance Rate</div>
-            <div class="ai-grid-card-desc">Share of samples that passed food safety standards under the current filter selection.</div>
-            <div class="ai-grid-card-badge" style="background:rgba(37,99,235,0.08);color:#2563EB;border:1px solid rgba(37,99,235,0.2);">{above_below}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with gc3:
-        st.markdown(f"""
-        <div class="ai-grid-card">
-            <div class="ai-grid-card-accent" style="background:linear-gradient(90deg,#D97706,#F59E0B);"></div>
-            <div class="ai-grid-card-number" style="color:#D97706;">{health_cases:,}</div>
-            <div class="ai-grid-card-label">Health Cases</div>
-            <div class="ai-grid-card-desc">Total patient count recorded across filtered districts — directly correlated with food failures.</div>
-            <div class="ai-grid-card-badge" style="background:rgba(217,119,6,0.08);color:#D97706;border:1px solid rgba(217,119,6,0.2);">Monitoring Active</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with gc4:
-        st.markdown(f"""
-        <div class="ai-grid-card">
-            <div class="ai-grid-card-accent" style="background:linear-gradient(90deg,#7C3AED,#8B5CF6);"></div>
-            <div class="ai-grid-card-number" style="color:#7C3AED;">{top_cat_rate}%</div>
-            <div class="ai-grid-card-label">Top Category Risk</div>
-            <div class="ai-grid-card-desc">{safe(top_cat_name)} has the highest category-level failure rate and requires priority intervention.</div>
-            <div class="ai-grid-card-badge" style="background:rgba(124,58,237,0.08);color:#7C3AED;border:1px solid rgba(124,58,237,0.2);">{safe(top_cat_name)}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-
-    # ── Ranked Blocks — using st.columns + individual st.markdown per row ──
-    rb1, rb2 = st.columns([1, 1])
-    rank_colors = ["#E11D48","#F43F5E","#D97706","#F59E0B","#0891B2"]
-    max_rate = top5_rates[0] if top5_rates else 1
-
-    with rb1:
-        # Build header
-        st.markdown("""
-        <div class="ai-ranked-block">
-            <div style="font-size:15px;font-weight:700;color:var(--text-primary);margin-bottom:14px;display:flex;align-items:center;gap:8px;">
-                🏆 Top Risk Districts
-                <span style="font-size:11px;font-weight:600;color:#94A3B8;background:var(--bg-card2);border:1px solid var(--border);border-radius:20px;padding:2px 8px;">by failure rate</span>
-            </div>
-        """, unsafe_allow_html=True)
-        for i, (dist, rate) in enumerate(zip(top5_districts[:5], top5_rates[:5])):
-            bar_pct = int((rate / max_rate) * 100) if max_rate > 0 else 0
-            col = rank_colors[i]
+if tab_ai is not None:
+    with tab_ai:
+        # Show trial expiry warning if applicable
+        if current_user_info().get('plan') == 'Trial' and not is_trial_expired():
+            _secs_left = trial_time_remaining()
+            _hrs  = int(_secs_left // 3600)
+            _mins = int((_secs_left % 3600) // 60)
             st.markdown(f"""
-            <div class="ai-ranked-item">
-                <div class="ai-rank-badge" style="background:{col};">#{i+1}</div>
-                <div class="ai-rank-name">{safe(dist)}</div>
-                <div class="ai-rank-bar-wrap"><div class="ai-rank-bar" style="width:{bar_pct}%;background:{col};"></div></div>
-                <div class="ai-rank-val" style="color:{col};">{rate}%</div>
+            <div style="background:rgba(217,119,6,0.08);border:1px solid rgba(217,119,6,0.30);
+                        border-radius:14px;padding:14px 20px;margin-bottom:18px;
+                        display:flex;align-items:center;gap:14px;">
+                <span style="font-size:24px;">⏳</span>
+                <div style="flex:1;">
+                    <div style="font-weight:700;color:#D97706;font-size:14px;">Trial Mode — {_hrs}h {_mins}m remaining</div>
+                    <div style="color:#94A3B8;font-size:12px;">Upgrade to Pro or Enterprise to keep access after your trial ends.</div>
+                </div>
             </div>
             """, unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with rb2:
-        cat_fail_top = cat_fail_rates.head(5)
-        cat_icons  = ["🥛","🫒","🧂","💧","🌾"]
-        cat_colors = ["#E11D48","#D97706","#7C3AED","#0891B2","#059669"]
-        top_cat_fail_rate = cat_fail_top.iloc[0]["FailRate"] if len(cat_fail_top) > 0 else 1
 
         st.markdown("""
-        <div class="ai-ranked-block">
-            <div style="font-size:15px;font-weight:700;color:var(--text-primary);margin-bottom:14px;display:flex;align-items:center;gap:8px;">
-                🍽️ Top Risk Categories
-                <span style="font-size:11px;font-weight:600;color:#94A3B8;background:var(--bg-card2);border:1px solid var(--border);border-radius:20px;padding:2px 8px;">by failure rate</span>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+            <div>
+                <div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);">🤖 AI Food Safety Assistant</div>
+                <div style="color:#64748B;font-size:14px;margin-top:4px;">Powered by Groq AI (LLaMA-3 70B) — live intelligence briefing and interactive Q&amp;A</div>
             </div>
-        """, unsafe_allow_html=True)
-        for i, row in enumerate(cat_fail_top.itertuples()):
-            icon   = cat_icons[i] if i < len(cat_icons) else "🍽️"
-            col    = cat_colors[i] if i < len(cat_colors) else "#64748B"
-            barpct = int((row.FailRate / top_cat_fail_rate) * 100) if top_cat_fail_rate > 0 else 0
-            st.markdown(f"""
-            <div class="ai-ranked-item">
-                <div class="ai-rank-badge" style="background:{col};font-size:14px;">{icon}</div>
-                <div class="ai-rank-name">{safe(row.CategoryName)}</div>
-                <div class="ai-rank-bar-wrap"><div class="ai-rank-bar" style="width:{barpct}%;background:{col};"></div></div>
-                <div class="ai-rank-val" style="color:{col};">{row.FailRate}%</div>
-            </div>
-            """, unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
-
-    # ── SECTION 2: Groq AI Live Briefing ──
-    st.markdown("""
-    <div style="font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:700;
-                color:var(--text-primary);margin-bottom:4px;">⚡ AI Intelligence Briefing</div>
-    <div style="color:#64748B;font-size:13px;margin-bottom:16px;">Generated by Groq · LLaMA-3 70B — updates when filters change</div>
-    """, unsafe_allow_html=True)
-
-    briefing_cache_key = f"{month_filter}|{district_filter}|{category_filter}|{result_filter}|{total_samples}"
-
-    if (
-        "ai_structured_insights" not in st.session_state
-        or st.session_state.get("ai_briefing_cache_key") != briefing_cache_key
-    ):
-        with st.spinner("⚡ Groq AI is generating your intelligence briefing..."):
-            try:
-                insights_data = get_ai_structured_insights(context_summary)
-                st.session_state["ai_structured_insights"] = insights_data
-                st.session_state["ai_briefing_cache_key"] = briefing_cache_key
-            except Exception as e:
-                st.session_state["ai_structured_insights"] = None
-                st.session_state["ai_briefing_cache_key"] = briefing_cache_key
-
-    ins = st.session_state.get("ai_structured_insights")
-
-    if ins:
-        # Safely extract and escape ALL AI text fields
-        critical_alert_text   = safe(ins.get("critical_alert", "—"))
-        trend_summary_text    = safe(ins.get("trend_summary", "—"))
-        health_corr_text      = safe(ins.get("health_correlation", "—"))
-        top_cat_risk_text     = safe(ins.get("top_category_risk", "—"))
-        forecast_text_val     = safe(ins.get("forecast_sentence", "—"))
-        risk_level_text       = safe(ins.get("risk_level", "Moderate"))
-        confidence_text       = safe(ins.get("confidence", "—"))
-        critical_districts    = [safe(d) for d in ins.get("critical_districts", [])]
-        recommendations       = [safe(r) for r in ins.get("recommendations", [])]
-
-        alert_color = "#E11D48" if ins.get("risk_level","Moderate") in ["High","Critical"] else "#D97706"
-        alert_bg    = "rgba(225,29,72,0.04)" if alert_color == "#E11D48" else "rgba(217,119,6,0.04)"
-
-        # ── Block A: Critical Alert ──
-        district_pills_html = "".join([
-            f'<span class="ai-stat-pill"><span style="color:{alert_color};">⚠</span> {d}</span>'
-            for d in critical_districts
-        ])
-        conf_pill = f'<span class="ai-stat-pill"><span style="color:#94A3B8;">🎯</span> Confidence: {confidence_text}</span>'
-
-        st.markdown(f"""
-        <div class="ai-block-primary" style="border-left:4px solid {alert_color};background:{alert_bg};">
-            <div class="ai-block-accent-bar" style="background:linear-gradient(90deg,{alert_color},transparent);opacity:0.4;"></div>
-            <div class="ai-block-header">
-                <div class="ai-block-icon-wrap" style="background:{alert_color}18;">🚨</div>
-                <div style="flex:1;">
-                    <div class="ai-block-subtitle">Critical Alert · AI Assessment</div>
-                    <div class="ai-block-title">Immediate Risk Signal Detected</div>
-                </div>
-                <div>
-                    <span style="background:{alert_color}15;color:{alert_color};border:1px solid {alert_color}30;border-radius:20px;padding:4px 14px;font-size:12px;font-weight:700;white-space:nowrap;">{risk_level_text} Risk</span>
-                </div>
-            </div>
-            <div class="ai-block-body">{critical_alert_text}</div>
-            <div class="ai-stat-row">
-                {district_pills_html}
-                {conf_pill}
-            </div>
+            <div class="live-tag"><span class="live-dot"></span> LIVE ANALYSIS</div>
         </div>
         """, unsafe_allow_html=True)
 
-        # ── Row: Trend + Health ──
-        blk_c1, blk_c2 = st.columns(2)
-        with blk_c1:
-            st.markdown(f"""
-            <div class="ai-block-primary" style="border-left:4px solid #2563EB;">
-                <div class="ai-block-accent-bar" style="background:linear-gradient(90deg,#2563EB,transparent);opacity:0.3;"></div>
-                <div class="ai-block-header">
-                    <div class="ai-block-icon-wrap" style="background:rgba(37,99,235,0.12);">📈</div>
-                    <div>
-                        <div class="ai-block-subtitle">Pattern Recognition · Trend Layer</div>
-                        <div class="ai-block-title">Key Data Trends</div>
-                    </div>
-                </div>
-                <div class="ai-block-body">{trend_summary_text}</div>
-                <div class="ai-stat-row">
-                    <span class="ai-stat-pill"><span style="color:#E11D48;">📉</span> Fail: {adulteration}%</span>
-                    <span class="ai-stat-pill"><span style="color:#059669;">✓</span> Pass: {pass_rate}%</span>
-                    <span class="ai-stat-pill"><span style="color:#2563EB;">🧪</span> {total_samples:,} samples</span>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+        ai1, ai2, ai3 = st.columns(3)
+        with ai1: st.markdown(kpi("⚡", "AI Engine",    "Groq · LLaMA-3",  "Ultra-fast inference",      "up", "kpi-amber"),  unsafe_allow_html=True)
+        with ai2: st.markdown(kpi("💬", "Responses",    "Real-time",        "Context-aware answers",     "up", "kpi-blue"),   unsafe_allow_html=True)
+        with ai3: st.markdown(kpi("🎯", "Accuracy",     "98%",              "Data-grounded insights",    "up", "kpi-green"),  unsafe_allow_html=True)
 
-        with blk_c2:
-            st.markdown(f"""
-            <div class="ai-block-primary" style="border-left:4px solid #0891B2;">
-                <div class="ai-block-accent-bar" style="background:linear-gradient(90deg,#0891B2,transparent);opacity:0.3;"></div>
-                <div class="ai-block-header">
-                    <div class="ai-block-icon-wrap" style="background:rgba(8,145,178,0.12);">🏥</div>
-                    <div>
-                        <div class="ai-block-subtitle">Public Health · Impact Correlation</div>
-                        <div class="ai-block-title">Health Impact Analysis</div>
-                    </div>
-                </div>
-                <div class="ai-block-body">{health_corr_text}</div>
-                <div class="ai-stat-row">
-                    <span class="ai-stat-pill"><span style="color:#E11D48;">🚑</span> {health_cases:,} cases</span>
-                    <span class="ai-stat-pill"><span style="color:#0891B2;">📍</span> {safe(top_risk_dist)}</span>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+        st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
 
-        # ── Block: Category Risk ──
-        cat_stat_pills = "".join([
-            f'<span class="ai-stat-pill"><span style="color:#7C3AED;">🏷</span> {safe(row.CategoryName)}: {row.FailRate}%</span>'
-            for row in cat_fail_rates.head(3).itertuples()
-        ])
-        st.markdown(f"""
-        <div class="ai-block-primary" style="border-left:4px solid #7C3AED;">
-            <div class="ai-block-accent-bar" style="background:linear-gradient(90deg,#7C3AED,transparent);opacity:0.3;"></div>
-            <div class="ai-block-header">
-                <div class="ai-block-icon-wrap" style="background:rgba(124,58,237,0.12);">🍽️</div>
-                <div style="flex:1;">
-                    <div class="ai-block-subtitle">Food Category · Risk Intelligence</div>
-                    <div class="ai-block-title">Category Risk Focus</div>
-                </div>
-                <div>
-                    <span style="background:rgba(124,58,237,0.1);color:#7C3AED;border:1px solid rgba(124,58,237,0.25);border-radius:20px;padding:4px 14px;font-size:12px;font-weight:700;white-space:nowrap;">{safe(top_cat_name)} · {top_cat_rate}% fail</span>
-                </div>
-            </div>
-            <div class="ai-block-body">{top_cat_risk_text}</div>
-            <div class="ai-stat-row">
-                {cat_stat_pills}
-            </div>
-        </div>
+        # Build context summary
+        context_summary = f"""
+        - Total samples tested: {total_samples:,}
+        - Passed: {passed:,} ({pass_rate}% pass rate) | Failed: {failed:,}
+        - Overall adulteration rate: {adulteration}%
+        - Total health cases recorded: {health_cases:,}
+        - Top failure category: {top_risk_cat} ({top_cat_rate}% fail rate)
+        - Top failure district: {top_risk_dist}
+        - Top 5 high-risk districts by fail rate: {', '.join([f"{d} ({r}%)" for d, r in zip(top5_districts[:5], top5_rates[:5])])}
+        - Active filter — Month: {month_filter}, District: {district_filter}, Category: {category_filter}
+        - Current risk level: {"Critical" if adulteration > 35 else "High" if adulteration > 25 else "Moderate" if adulteration > 10 else "Low"}
+        - Inspections data: High Risk violations dominate, Street Vendors most cited
+        """
+
+        # ── SECTION 1: Static Data Blocks ──
+        st.markdown("""
+        <div style="font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:700;
+                    color:var(--text-primary);margin-bottom:4px;">📊 Data Intelligence Blocks</div>
+        <div style="color:#64748B;font-size:13px;margin-bottom:16px;">Derived directly from your filtered dataset</div>
         """, unsafe_allow_html=True)
 
-        # ── Block: Action Timeline ──
-        rec_icons_list  = ["🎯","🔍","📋","💡","🛡️"]
-        rec_colors_list = ["#E11D48","#2563EB","#059669","#D97706","#7C3AED"]
-        priority_labels = ["Critical","High","Medium","Medium","Low"]
-        action_count    = len(recommendations)
+        gc1, gc2, gc3, gc4 = st.columns(4)
 
-        _rows = ""
-        for i, rec in enumerate(recommendations[:5]):
-            ico    = rec_icons_list[i]  if i < len(rec_icons_list)  else "📌"
-            col    = rec_colors_list[i] if i < len(rec_colors_list) else "#64748B"
-            plabel = priority_labels[i] if i < len(priority_labels) else "Medium"
-            is_last = (i == min(len(recommendations), 5) - 1)
-            _line = "" if is_last else f'<div style="position:absolute;left:17px;top:38px;bottom:0;width:2px;background:rgba(0,0,0,0.08);"></div>'
-            _rows += (
-                f'<div style="display:flex;gap:16px;padding-bottom:20px;position:relative;">'
-                f'{_line}'
-                f'<div style="width:36px;height:36px;border-radius:10px;display:flex;align-items:center;'
-                f'justify-content:center;font-size:16px;flex-shrink:0;z-index:1;min-width:36px;'
-                f'background:{col}18;border:2px solid {col}30;">{ico}</div>'
-                f'<div style="flex:1;">'
-                f'<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;'
-                f'color:#64748B;margin-bottom:4px;">ACTION {i+1} &bull; PRIORITY {plabel.upper()}</div>'
-                f'<div style="font-size:14px;color:#475569;line-height:1.6;">{rec}</div>'
-                f'</div>'
-                f'</div>'
+        risk_badge_color = "#E11D48" if adulteration > 25 else "#D97706" if adulteration > 10 else "#059669"
+        risk_badge_bg    = "rgba(225,29,72,0.08)" if adulteration > 25 else "rgba(217,119,6,0.08)" if adulteration > 10 else "rgba(5,150,105,0.08)"
+        risk_badge_label = "Critical Risk" if adulteration > 35 else "High Risk" if adulteration > 25 else "Moderate Risk" if adulteration > 10 else "Safe Zone"
+
+        with gc1:
+            st.markdown(f"""
+            <div class="ai-grid-card">
+                <div class="ai-grid-card-accent" style="background:linear-gradient(90deg,#E11D48,#F43F5E);"></div>
+                <div class="ai-grid-card-number" style="color:#E11D48;">{adulteration}%</div>
+                <div class="ai-grid-card-label">Adulteration Rate</div>
+                <div class="ai-grid-card-desc">Overall proportion of food samples failing quality tests across all monitored categories.</div>
+                <div class="ai-grid-card-badge" style="background:{risk_badge_bg};color:{risk_badge_color};border:1px solid {risk_badge_color}22;">{risk_badge_label}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with gc2:
+            above_below = "Above Target ✓" if pass_rate > 75 else "Below Target ↓"
+            st.markdown(f"""
+            <div class="ai-grid-card">
+                <div class="ai-grid-card-accent" style="background:linear-gradient(90deg,#2563EB,#0891B2);"></div>
+                <div class="ai-grid-card-number" style="color:#2563EB;">{pass_rate}%</div>
+                <div class="ai-grid-card-label">Compliance Rate</div>
+                <div class="ai-grid-card-desc">Share of samples that passed food safety standards under the current filter selection.</div>
+                <div class="ai-grid-card-badge" style="background:rgba(37,99,235,0.08);color:#2563EB;border:1px solid rgba(37,99,235,0.2);">{above_below}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with gc3:
+            st.markdown(f"""
+            <div class="ai-grid-card">
+                <div class="ai-grid-card-accent" style="background:linear-gradient(90deg,#D97706,#F59E0B);"></div>
+                <div class="ai-grid-card-number" style="color:#D97706;">{health_cases:,}</div>
+                <div class="ai-grid-card-label">Health Cases</div>
+                <div class="ai-grid-card-desc">Total patient count recorded across filtered districts — directly correlated with food failures.</div>
+                <div class="ai-grid-card-badge" style="background:rgba(217,119,6,0.08);color:#D97706;border:1px solid rgba(217,119,6,0.2);">Monitoring Active</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with gc4:
+            st.markdown(f"""
+            <div class="ai-grid-card">
+                <div class="ai-grid-card-accent" style="background:linear-gradient(90deg,#7C3AED,#8B5CF6);"></div>
+                <div class="ai-grid-card-number" style="color:#7C3AED;">{top_cat_rate}%</div>
+                <div class="ai-grid-card-label">Top Category Risk</div>
+                <div class="ai-grid-card-desc">{safe(top_cat_name)} has the highest category-level failure rate and requires priority intervention.</div>
+                <div class="ai-grid-card-badge" style="background:rgba(124,58,237,0.08);color:#7C3AED;border:1px solid rgba(124,58,237,0.2);">{safe(top_cat_name)}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+
+        # ── Ranked Blocks — using st.columns + individual st.markdown per row ──
+        rb1, rb2 = st.columns([1, 1])
+        rank_colors = ["#E11D48","#F43F5E","#D97706","#F59E0B","#0891B2"]
+        max_rate = top5_rates[0] if top5_rates else 1
+
+        with rb1:
+            # Build header
+            st.markdown("""
+            <div class="ai-ranked-block">
+                <div style="font-size:15px;font-weight:700;color:var(--text-primary);margin-bottom:14px;display:flex;align-items:center;gap:8px;">
+                    🏆 Top Risk Districts
+                    <span style="font-size:11px;font-weight:600;color:#94A3B8;background:var(--bg-card2);border:1px solid var(--border);border-radius:20px;padding:2px 8px;">by failure rate</span>
+                </div>
+            """, unsafe_allow_html=True)
+            for i, (dist, rate) in enumerate(zip(top5_districts[:5], top5_rates[:5])):
+                bar_pct = int((rate / max_rate) * 100) if max_rate > 0 else 0
+                col = rank_colors[i]
+                st.markdown(f"""
+                <div class="ai-ranked-item">
+                    <div class="ai-rank-badge" style="background:{col};">#{i+1}</div>
+                    <div class="ai-rank-name">{safe(dist)}</div>
+                    <div class="ai-rank-bar-wrap"><div class="ai-rank-bar" style="width:{bar_pct}%;background:{col};"></div></div>
+                    <div class="ai-rank-val" style="color:{col};">{rate}%</div>
+                </div>
+                """, unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with rb2:
+            cat_fail_top = cat_fail_rates.head(5)
+            cat_icons  = ["🥛","🫒","🧂","💧","🌾"]
+            cat_colors = ["#E11D48","#D97706","#7C3AED","#0891B2","#059669"]
+            top_cat_fail_rate = cat_fail_top.iloc[0]["FailRate"] if len(cat_fail_top) > 0 else 1
+
+            st.markdown("""
+            <div class="ai-ranked-block">
+                <div style="font-size:15px;font-weight:700;color:var(--text-primary);margin-bottom:14px;display:flex;align-items:center;gap:8px;">
+                    🍽️ Top Risk Categories
+                    <span style="font-size:11px;font-weight:600;color:#94A3B8;background:var(--bg-card2);border:1px solid var(--border);border-radius:20px;padding:2px 8px;">by failure rate</span>
+                </div>
+            """, unsafe_allow_html=True)
+            for i, row in enumerate(cat_fail_top.itertuples()):
+                icon   = cat_icons[i] if i < len(cat_icons) else "🍽️"
+                col    = cat_colors[i] if i < len(cat_colors) else "#64748B"
+                barpct = int((row.FailRate / top_cat_fail_rate) * 100) if top_cat_fail_rate > 0 else 0
+                st.markdown(f"""
+                <div class="ai-ranked-item">
+                    <div class="ai-rank-badge" style="background:{col};font-size:14px;">{icon}</div>
+                    <div class="ai-rank-name">{safe(row.CategoryName)}</div>
+                    <div class="ai-rank-bar-wrap"><div class="ai-rank-bar" style="width:{barpct}%;background:{col};"></div></div>
+                    <div class="ai-rank-val" style="color:{col};">{row.FailRate}%</div>
+                </div>
+                """, unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
+
+        # ── SECTION 2: Groq AI Live Briefing ──
+        st.markdown("""
+        <div style="font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:700;
+                    color:var(--text-primary);margin-bottom:4px;">⚡ AI Intelligence Briefing</div>
+        <div style="color:#64748B;font-size:13px;margin-bottom:16px;">Generated by Groq · LLaMA-3 70B — updates when filters change</div>
+        """, unsafe_allow_html=True)
+
+        briefing_cache_key = f"{month_filter}|{district_filter}|{category_filter}|{result_filter}|{total_samples}"
+
+        if (
+            "ai_structured_insights" not in st.session_state
+            or st.session_state.get("ai_briefing_cache_key") != briefing_cache_key
+        ):
+            with st.spinner("⚡ Groq AI is generating your intelligence briefing..."):
+                try:
+                    insights_data = get_ai_structured_insights(context_summary)
+                    st.session_state["ai_structured_insights"] = insights_data
+                    st.session_state["ai_briefing_cache_key"] = briefing_cache_key
+                except Exception as e:
+                    st.session_state["ai_structured_insights"] = None
+                    st.session_state["ai_briefing_cache_key"] = briefing_cache_key
+
+        ins = st.session_state.get("ai_structured_insights")
+
+        if ins:
+            # Safely extract and escape ALL AI text fields
+            critical_alert_text   = safe(ins.get("critical_alert", "—"))
+            trend_summary_text    = safe(ins.get("trend_summary", "—"))
+            health_corr_text      = safe(ins.get("health_correlation", "—"))
+            top_cat_risk_text     = safe(ins.get("top_category_risk", "—"))
+            forecast_text_val     = safe(ins.get("forecast_sentence", "—"))
+            risk_level_text       = safe(ins.get("risk_level", "Moderate"))
+            confidence_text       = safe(ins.get("confidence", "—"))
+            critical_districts    = [safe(d) for d in ins.get("critical_districts", [])]
+            recommendations       = [safe(r) for r in ins.get("recommendations", [])]
+
+            alert_color = "#E11D48" if ins.get("risk_level","Moderate") in ["High","Critical"] else "#D97706"
+            alert_bg    = "rgba(225,29,72,0.04)" if alert_color == "#E11D48" else "rgba(217,119,6,0.04)"
+
+            # ── Block A: Critical Alert ──
+            district_pills_html = "".join([
+                f'<span class="ai-stat-pill"><span style="color:{alert_color};">⚠</span> {d}</span>'
+                for d in critical_districts
+            ])
+            conf_pill = f'<span class="ai-stat-pill"><span style="color:#94A3B8;">🎯</span> Confidence: {confidence_text}</span>'
+
+            st.markdown(f"""
+            <div class="ai-block-primary" style="border-left:4px solid {alert_color};background:{alert_bg};">
+                <div class="ai-block-accent-bar" style="background:linear-gradient(90deg,{alert_color},transparent);opacity:0.4;"></div>
+                <div class="ai-block-header">
+                    <div class="ai-block-icon-wrap" style="background:{alert_color}18;">🚨</div>
+                    <div style="flex:1;">
+                        <div class="ai-block-subtitle">Critical Alert · AI Assessment</div>
+                        <div class="ai-block-title">Immediate Risk Signal Detected</div>
+                    </div>
+                    <div>
+                        <span style="background:{alert_color}15;color:{alert_color};border:1px solid {alert_color}30;border-radius:20px;padding:4px 14px;font-size:12px;font-weight:700;white-space:nowrap;">{risk_level_text} Risk</span>
+                    </div>
+                </div>
+                <div class="ai-block-body">{critical_alert_text}</div>
+                <div class="ai-stat-row">
+                    {district_pills_html}
+                    {conf_pill}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # ── Row: Trend + Health ──
+            blk_c1, blk_c2 = st.columns(2)
+            with blk_c1:
+                st.markdown(f"""
+                <div class="ai-block-primary" style="border-left:4px solid #2563EB;">
+                    <div class="ai-block-accent-bar" style="background:linear-gradient(90deg,#2563EB,transparent);opacity:0.3;"></div>
+                    <div class="ai-block-header">
+                        <div class="ai-block-icon-wrap" style="background:rgba(37,99,235,0.12);">📈</div>
+                        <div>
+                            <div class="ai-block-subtitle">Pattern Recognition · Trend Layer</div>
+                            <div class="ai-block-title">Key Data Trends</div>
+                        </div>
+                    </div>
+                    <div class="ai-block-body">{trend_summary_text}</div>
+                    <div class="ai-stat-row">
+                        <span class="ai-stat-pill"><span style="color:#E11D48;">📉</span> Fail: {adulteration}%</span>
+                        <span class="ai-stat-pill"><span style="color:#059669;">✓</span> Pass: {pass_rate}%</span>
+                        <span class="ai-stat-pill"><span style="color:#2563EB;">🧪</span> {total_samples:,} samples</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with blk_c2:
+                st.markdown(f"""
+                <div class="ai-block-primary" style="border-left:4px solid #0891B2;">
+                    <div class="ai-block-accent-bar" style="background:linear-gradient(90deg,#0891B2,transparent);opacity:0.3;"></div>
+                    <div class="ai-block-header">
+                        <div class="ai-block-icon-wrap" style="background:rgba(8,145,178,0.12);">🏥</div>
+                        <div>
+                            <div class="ai-block-subtitle">Public Health · Impact Correlation</div>
+                            <div class="ai-block-title">Health Impact Analysis</div>
+                        </div>
+                    </div>
+                    <div class="ai-block-body">{health_corr_text}</div>
+                    <div class="ai-stat-row">
+                        <span class="ai-stat-pill"><span style="color:#E11D48;">🚑</span> {health_cases:,} cases</span>
+                        <span class="ai-stat-pill"><span style="color:#0891B2;">📍</span> {safe(top_risk_dist)}</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # ── Block: Category Risk ──
+            cat_stat_pills = "".join([
+                f'<span class="ai-stat-pill"><span style="color:#7C3AED;">🏷</span> {safe(row.CategoryName)}: {row.FailRate}%</span>'
+                for row in cat_fail_rates.head(3).itertuples()
+            ])
+            st.markdown(f"""
+            <div class="ai-block-primary" style="border-left:4px solid #7C3AED;">
+                <div class="ai-block-accent-bar" style="background:linear-gradient(90deg,#7C3AED,transparent);opacity:0.3;"></div>
+                <div class="ai-block-header">
+                    <div class="ai-block-icon-wrap" style="background:rgba(124,58,237,0.12);">🍽️</div>
+                    <div style="flex:1;">
+                        <div class="ai-block-subtitle">Food Category · Risk Intelligence</div>
+                        <div class="ai-block-title">Category Risk Focus</div>
+                    </div>
+                    <div>
+                        <span style="background:rgba(124,58,237,0.1);color:#7C3AED;border:1px solid rgba(124,58,237,0.25);border-radius:20px;padding:4px 14px;font-size:12px;font-weight:700;white-space:nowrap;">{safe(top_cat_name)} · {top_cat_rate}% fail</span>
+                    </div>
+                </div>
+                <div class="ai-block-body">{top_cat_risk_text}</div>
+                <div class="ai-stat-row">
+                    {cat_stat_pills}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # ── Block: Action Timeline ──
+            rec_icons_list  = ["🎯","🔍","📋","💡","🛡️"]
+            rec_colors_list = ["#E11D48","#2563EB","#059669","#D97706","#7C3AED"]
+            priority_labels = ["Critical","High","Medium","Medium","Low"]
+            action_count    = len(recommendations)
+
+            _rows = ""
+            for i, rec in enumerate(recommendations[:5]):
+                ico    = rec_icons_list[i]  if i < len(rec_icons_list)  else "📌"
+                col    = rec_colors_list[i] if i < len(rec_colors_list) else "#64748B"
+                plabel = priority_labels[i] if i < len(priority_labels) else "Medium"
+                is_last = (i == min(len(recommendations), 5) - 1)
+                _line = "" if is_last else f'<div style="position:absolute;left:17px;top:38px;bottom:0;width:2px;background:rgba(0,0,0,0.08);"></div>'
+                _rows += (
+                    f'<div style="display:flex;gap:16px;padding-bottom:20px;position:relative;">'
+                    f'{_line}'
+                    f'<div style="width:36px;height:36px;border-radius:10px;display:flex;align-items:center;'
+                    f'justify-content:center;font-size:16px;flex-shrink:0;z-index:1;min-width:36px;'
+                    f'background:{col}18;border:2px solid {col}30;">{ico}</div>'
+                    f'<div style="flex:1;">'
+                    f'<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;'
+                    f'color:#64748B;margin-bottom:4px;">ACTION {i+1} &bull; PRIORITY {plabel.upper()}</div>'
+                    f'<div style="font-size:14px;color:#475569;line-height:1.6;">{rec}</div>'
+                    f'</div>'
+                    f'</div>'
+                )
+
+            st.markdown(
+                f'<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:16px;'
+                f'padding:22px;box-shadow:var(--shadow-sm);">'
+                f'<div style="font-size:15px;font-weight:700;color:var(--text-primary);margin-bottom:18px;'
+                f'display:flex;align-items:center;gap:10px;">'
+                f'&#9989; AI Recommended Action Plan'
+                f'<span style="font-size:11px;font-weight:600;color:#059669;background:rgba(5,150,105,0.08);'
+                f'border:1px solid rgba(5,150,105,0.2);border-radius:20px;padding:2px 10px;">'
+                f'{action_count} actions identified</span></div>'
+                f'{_rows}'
+                f'</div>',
+                unsafe_allow_html=True
             )
 
+            # ── Block: Forecast ──
+            st.markdown(f"""
+            <div style="background:linear-gradient(135deg,rgba(124,58,237,0.06),rgba(37,99,235,0.04));
+                        border:1px solid rgba(124,58,237,0.18);border-radius:16px;padding:20px 24px;
+                        display:flex;align-items:center;gap:16px;margin-top:4px;">
+                <div style="background:linear-gradient(135deg,#7C3AED,#2563EB);width:42px;height:42px;
+                            border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">🔮</div>
+                <div>
+                    <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;color:#7C3AED;margin-bottom:4px;">AI Forward Projection</div>
+                    <div style="font-size:14px;color:var(--text-dim);line-height:1.7;">{forecast_text_val}</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        else:
+            st.warning("⚠️ AI briefing unavailable. Check your Groq API key or try refreshing.")
+            st.markdown(f"""
+            <div class="ai-block-primary" style="border-left:4px solid #D97706;">
+                <div class="ai-block-body">
+                    Based on current data: <b>{adulteration}%</b> adulteration rate with
+                    <b>{safe(top_risk_cat)}</b> as the highest-risk category and
+                    <b>{safe(top_risk_dist)}</b> as the most critical district.
+                    Total health cases recorded: <b>{health_cases:,}</b>.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Refresh button
+        col_ref, _ = st.columns([1, 4])
+        with col_ref:
+            if st.button("🔄 Refresh AI Briefing", key="refresh_briefing"):
+                st.session_state.pop("ai_structured_insights", None)
+                st.session_state.pop("ai_briefing_cache_key", None)
+                st.rerun()
+
+        # ── SECTION 3: Chat + Voice ────────────────────────────────────
+        st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
+        st.markdown("""
+        <div style="font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:700;
+                    color:var(--text-primary);margin-bottom:12px;">
+            💬 Ask the AI Assistant
+            <span style="font-size:13px;font-weight:600;color:#059669;
+                         background:rgba(5,150,105,0.08);border:1px solid rgba(5,150,105,0.2);
+                         border-radius:20px;padding:3px 12px;margin-left:10px;">
+                🎤 Voice Enabled
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Quick-question buttons ──────────────────────────────────────
         st.markdown(
-            f'<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:16px;'
-            f'padding:22px;box-shadow:var(--shadow-sm);">'
-            f'<div style="font-size:15px;font-weight:700;color:var(--text-primary);margin-bottom:18px;'
-            f'display:flex;align-items:center;gap:10px;">'
-            f'&#9989; AI Recommended Action Plan'
-            f'<span style="font-size:11px;font-weight:600;color:#059669;background:rgba(5,150,105,0.08);'
-            f'border:1px solid rgba(5,150,105,0.2);border-radius:20px;padding:2px 10px;">'
-            f'{action_count} actions identified</span></div>'
-            f'{_rows}'
-            f'</div>',
-            unsafe_allow_html=True
+            "<div style='font-size:13px;font-weight:600;color:#64748B;margin-bottom:8px;'>"
+            "💡 Quick questions:</div>",
+            unsafe_allow_html=True,
         )
-
-        # ── Block: Forecast ──
-        st.markdown(f"""
-        <div style="background:linear-gradient(135deg,rgba(124,58,237,0.06),rgba(37,99,235,0.04));
-                    border:1px solid rgba(124,58,237,0.18);border-radius:16px;padding:20px 24px;
-                    display:flex;align-items:center;gap:16px;margin-top:4px;">
-            <div style="background:linear-gradient(135deg,#7C3AED,#2563EB);width:42px;height:42px;
-                        border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">🔮</div>
-            <div>
-                <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;color:#7C3AED;margin-bottom:4px;">AI Forward Projection</div>
-                <div style="font-size:14px;color:var(--text-dim);line-height:1.7;">{forecast_text_val}</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    else:
-        st.warning("⚠️ AI briefing unavailable. Check your Groq API key or try refreshing.")
-        st.markdown(f"""
-        <div class="ai-block-primary" style="border-left:4px solid #D97706;">
-            <div class="ai-block-body">
-                Based on current data: <b>{adulteration}%</b> adulteration rate with
-                <b>{safe(top_risk_cat)}</b> as the highest-risk category and
-                <b>{safe(top_risk_dist)}</b> as the most critical district.
-                Total health cases recorded: <b>{health_cases:,}</b>.
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # Refresh button
-    col_ref, _ = st.columns([1, 4])
-    with col_ref:
-        if st.button("🔄 Refresh AI Briefing", key="refresh_briefing"):
-            st.session_state.pop("ai_structured_insights", None)
-            st.session_state.pop("ai_briefing_cache_key", None)
-            st.rerun()
-
-    # ── SECTION 3: Chat + Voice ────────────────────────────────────
-    st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
-    st.markdown("""
-    <div style="font-family:'Space Grotesk',sans-serif;font-size:20px;font-weight:700;
-                color:var(--text-primary);margin-bottom:12px;">
-        💬 Ask the AI Assistant
-        <span style="font-size:13px;font-weight:600;color:#059669;
-                     background:rgba(5,150,105,0.08);border:1px solid rgba(5,150,105,0.2);
-                     border-radius:20px;padding:3px 12px;margin-left:10px;">
-            🎤 Voice Enabled
-        </span>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Quick-question buttons ──────────────────────────────────────
-    st.markdown(
-        "<div style='font-size:13px;font-weight:600;color:#64748B;margin-bottom:8px;'>"
-        "💡 Quick questions:</div>",
-        unsafe_allow_html=True,
-    )
-    qcols = st.columns(4)
-    quick_qs = [
-        "Which districts need immediate action?",
-        "What are the top food safety risks?",
-        "How does health impact correlate with failures?",
-        "Recommend an intervention strategy",
-    ]
-    for i, (qcol, question) in enumerate(zip(qcols, quick_qs)):
-        with qcol:
-            if st.button(question, key=f"quick_{i}", use_container_width=True):
-                if (
-                    not st.session_state.chat_history
-                    or st.session_state.chat_history[-1].get("content") != question
-                ):
-                    st.session_state.chat_history.append(
-                        {"role": "user", "content": question}
-                    )
-                    with st.spinner("⚡ Groq AI is analysing…"):
-                        try:
-                            response = query_ai_assistant(question, context_summary)
-                            st.session_state.chat_history.append(
-                                {"role": "assistant", "content": response}
-                            )
-                        except Exception as e:
-                            st.session_state.chat_history.append(
-                                {"role": "assistant", "content": f"Sorry, error: {e}"}
-                            )
-                    st.rerun()
-
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-
-    # ── Voice + Text input row ──────────────────────────────────────
-    # Layout: [text input ──────────────────] [Send] [🎤 mic]
-    inp_col, send_col, mic_col = st.columns([5, 1, 1])
-
-    with inp_col:
-        user_input = st.text_input(
-            "Ask the AI assistant…",
-            placeholder="e.g. What should I prioritise in Tirupati district?  (or use the 🎤 mic)",
-            label_visibility="collapsed",
-            key="chat_input",
-        )
-
-    with send_col:
-        send_btn = st.button("Send 🚀", use_container_width=True)
-
-    with mic_col:
-        # mic_recorder returns None until the user records; then a dict with 'bytes'
-        audio_data = mic_recorder(
-            start_prompt="🎤 Record",
-            stop_prompt="⏹ Done",
-            just_once=True,        # resets after each recording so re-recording works
-            use_container_width=True,
-            key="voice_recorder",
-        )
-
-    # ── Voice transcription flow ────────────────────────────────────
-    if audio_data and audio_data.get("bytes"):
-        with st.spinner("🎙️ Transcribing your voice with Groq Whisper…"):
-            try:
-                transcript = transcribe_voice(audio_data["bytes"])
-                if transcript:
-                    st.success(f'🎤 Transcribed: "{transcript}"')
-                    # Avoid duplicate submissions
+        qcols = st.columns(4)
+        quick_qs = [
+            "Which districts need immediate action?",
+            "What are the top food safety risks?",
+            "How does health impact correlate with failures?",
+            "Recommend an intervention strategy",
+        ]
+        for i, (qcol, question) in enumerate(zip(qcols, quick_qs)):
+            with qcol:
+                if st.button(question, key=f"quick_{i}", use_container_width=True):
                     if (
                         not st.session_state.chat_history
-                        or st.session_state.chat_history[-1].get("content") != transcript
+                        or st.session_state.chat_history[-1].get("content") != question
                     ):
-                        st.session_state.last_submitted = transcript
                         st.session_state.chat_history.append(
-                            {"role": "user", "content": transcript}
+                            {"role": "user", "content": question}
                         )
-                        with st.spinner("⚡ Groq AI is analysing your question…"):
+                        with st.spinner("⚡ Groq AI is analysing…"):
                             try:
-                                response = query_ai_assistant(transcript, context_summary)
+                                response = query_ai_assistant(question, context_summary)
                                 st.session_state.chat_history.append(
                                     {"role": "assistant", "content": response}
                                 )
                             except Exception as e:
                                 st.session_state.chat_history.append(
-                                    {"role": "assistant", "content": f"Error: {e}"}
+                                    {"role": "assistant", "content": f"Sorry, error: {e}"}
                                 )
                         st.rerun()
-                else:
-                    st.warning("⚠️ No speech detected — please try again.")
-            except RuntimeError as err:
-                st.error(f"🎙️ Voice error: {err}")
 
-    # ── Text input / Send button flow ──────────────────────────────
-    pending_message = ""
-    if send_btn and user_input.strip():
-        pending_message = user_input.strip()
-    elif (
-        user_input.strip()
-        and user_input.strip() != st.session_state.last_submitted
-        and not send_btn
-    ):
-        pending_message = user_input.strip()
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
-    if pending_message:
-        st.session_state.last_submitted = pending_message
-        st.session_state.chat_history.append({"role": "user", "content": pending_message})
-        with st.spinner("⚡ Groq AI is analysing your data…"):
-            try:
-                response = query_ai_assistant(pending_message, context_summary)
-                st.session_state.chat_history.append(
-                    {"role": "assistant", "content": response}
-                )
-            except Exception as e:
-                st.session_state.chat_history.append(
-                    {"role": "assistant", "content": f"Error: {e}"}
-                )
-        st.rerun()
+        # ── Voice + Text input row ──────────────────────────────────────
+        # Layout: [text input ──────────────────] [Send] [🎤 mic]
+        inp_col, send_col, mic_col = st.columns([5, 1, 1])
 
-    # ── Chat history display ────────────────────────────────────────
-    if st.session_state.chat_history:
-        st.markdown('<div class="chat-container">', unsafe_allow_html=True)
-        for msg in st.session_state.chat_history:
-            if msg["role"] == "user":
-                st.markdown(
-                    f'<div class="chat-bubble-user">{safe(msg["content"])}</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    f'<div class="chat-bubble-ai">⚡ {safe(msg["content"])}</div>',
-                    unsafe_allow_html=True,
-                )
-        st.markdown("</div>", unsafe_allow_html=True)
+        with inp_col:
+            user_input = st.text_input(
+                "Ask the AI assistant…",
+                placeholder="e.g. What should I prioritise in Tirupati district?  (or use the 🎤 mic)",
+                label_visibility="collapsed",
+                key="chat_input",
+            )
 
-        if st.button("🗑️ Clear Chat", use_container_width=False):
-            st.session_state.chat_history = []
-            st.session_state.last_submitted = ""
+        with send_col:
+            send_btn = st.button("Send 🚀", use_container_width=True, key="chat_send_btn")
+
+        with mic_col:
+            # mic_recorder returns None until the user records; then a dict with 'bytes'
+            audio_data = mic_recorder(
+                start_prompt="🎤 Record",
+                stop_prompt="⏹ Done",
+                just_once=True,        # resets after each recording so re-recording works
+                use_container_width=True,
+                key="voice_recorder",
+            )
+
+        # ── Voice transcription flow ────────────────────────────────────
+        if audio_data and audio_data.get("bytes"):
+            with st.spinner("🎙️ Transcribing your voice with Groq Whisper…"):
+                try:
+                    transcript = transcribe_voice(audio_data["bytes"])
+                    if transcript:
+                        st.success(f'🎤 Transcribed: "{transcript}"')
+                        # Avoid duplicate submissions
+                        if (
+                            not st.session_state.chat_history
+                            or st.session_state.chat_history[-1].get("content") != transcript
+                        ):
+                            st.session_state.last_submitted = transcript
+                            st.session_state.chat_history.append(
+                                {"role": "user", "content": transcript}
+                            )
+                            with st.spinner("⚡ Groq AI is analysing your question…"):
+                                try:
+                                    response = query_ai_assistant(transcript, context_summary)
+                                    st.session_state.chat_history.append(
+                                        {"role": "assistant", "content": response}
+                                    )
+                                except Exception as e:
+                                    st.session_state.chat_history.append(
+                                        {"role": "assistant", "content": f"Error: {e}"}
+                                    )
+                            st.rerun()
+                    else:
+                        st.warning("⚠️ No speech detected — please try again.")
+                except RuntimeError as err:
+                    st.error(f"🎙️ Voice error: {err}")
+
+        # ── Text input / Send button flow ──────────────────────────────
+        pending_message = ""
+        if send_btn and user_input.strip():
+            pending_message = user_input.strip()
+        elif (
+            user_input.strip()
+            and user_input.strip() != st.session_state.last_submitted
+            and not send_btn
+        ):
+            pending_message = user_input.strip()
+
+        if pending_message:
+            st.session_state.last_submitted = pending_message
+            st.session_state.chat_history.append({"role": "user", "content": pending_message})
+            with st.spinner("⚡ Groq AI is analysing your data…"):
+                try:
+                    response = query_ai_assistant(pending_message, context_summary)
+                    st.session_state.chat_history.append(
+                        {"role": "assistant", "content": response}
+                    )
+                except Exception as e:
+                    st.session_state.chat_history.append(
+                        {"role": "assistant", "content": f"Error: {e}"}
+                    )
             st.rerun()
 
-    else:
-        st.markdown("""
-        <div style="background:var(--bg-card2);border:1px solid var(--border);border-radius:16px;
-                    padding:28px;text-align:center;margin-top:12px;">
-            <div style="font-size:32px;margin-bottom:10px;">🎤</div>
-            <div style="font-size:15px;font-weight:600;color:var(--text-primary);margin-bottom:6px;">
-                Start a conversation — type or speak
+        # ── Chat history display ────────────────────────────────────────
+        if st.session_state.chat_history:
+            st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+            for msg in st.session_state.chat_history:
+                if msg["role"] == "user":
+                    st.markdown(
+                        f'<div class="chat-bubble-user">{safe(msg["content"])}</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f'<div class="chat-bubble-ai">⚡ {safe(msg["content"])}</div>',
+                        unsafe_allow_html=True,
+                    )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            if st.button("🗑️ Clear Chat", use_container_width=False, key="clear_chat_btn"):
+                st.session_state.chat_history = []
+                st.session_state.last_submitted = ""
+                st.rerun()
+
+        else:
+            st.markdown("""
+            <div style="background:var(--bg-card2);border:1px solid var(--border);border-radius:16px;
+                        padding:28px;text-align:center;margin-top:12px;">
+                <div style="font-size:32px;margin-bottom:10px;">🎤</div>
+                <div style="font-size:15px;font-weight:600;color:var(--text-primary);margin-bottom:6px;">
+                    Start a conversation — type or speak
+                </div>
+                <div style="font-size:14px;color:#64748B;">
+                    Use the quick buttons, type your question, or click 🎤 Record to ask by voice.
+                </div>
             </div>
-            <div style="font-size:14px;color:#64748B;">
-                Use the quick buttons, type your question, or click 🎤 Record to ask by voice.
+            """, unsafe_allow_html=True)
+
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+
+        # ── Voice tips + capability pills ──────────────────────────────
+        st.markdown("""
+        <div style="background:var(--bg-card2);border-radius:14px;padding:18px;border:1px solid var(--border);">
+            <div style="font-size:14px;font-weight:700;color:var(--text-primary);margin-bottom:10px;">
+                🎯 What you can ask — by voice or text:
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <span class="stat-pill" style="background:rgba(37,99,235,0.08);color:#2563EB;border:1px solid rgba(37,99,235,0.2);">District-level risk analysis</span>
+                <span class="stat-pill" style="background:rgba(5,150,105,0.08);color:#059669;border:1px solid rgba(5,150,105,0.2);">Category contamination trends</span>
+                <span class="stat-pill" style="background:rgba(225,29,72,0.08);color:#E11D48;border:1px solid rgba(225,29,72,0.2);">Emergency action plans</span>
+                <span class="stat-pill" style="background:rgba(124,58,237,0.08);color:#7C3AED;border:1px solid rgba(124,58,237,0.2);">Health correlation insights</span>
+                <span class="stat-pill" style="background:rgba(217,119,6,0.08);color:#D97706;border:1px solid rgba(217,119,6,0.2);">Seasonal risk forecasting</span>
+                <span class="stat-pill" style="background:rgba(8,145,178,0.08);color:#0891B2;border:1px solid rgba(8,145,178,0.2);">Inspection resource allocation</span>
+                <span class="stat-pill" style="background:rgba(249,115,22,0.08);color:#F97316;border:1px solid rgba(249,115,22,0.2);">🎤 Speak any of the above</span>
+            </div>
+            <div style="margin-top:12px;padding:10px 14px;background:rgba(37,99,235,0.05);
+                        border:1px solid rgba(37,99,235,0.15);border-radius:10px;
+                        font-size:12px;color:#64748B;line-height:1.6;">
+                🎙️ <b style='color:var(--text-primary);'>Voice tip:</b>
+                Click <b>🎤 Record</b>, speak your question clearly, then click <b>⏹ Done</b>.
+                Groq Whisper will transcribe it and the AI will respond automatically.
+                Supports English, Telugu (<code>te</code>), and Hindi (<code>hi</code>)
+                — change the <code>language</code> param in <code>transcribe_voice()</code>.
             </div>
         </div>
         """, unsafe_allow_html=True)
-
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-
-    # ── Voice tips + capability pills ──────────────────────────────
-    st.markdown("""
-    <div style="background:var(--bg-card2);border-radius:14px;padding:18px;border:1px solid var(--border);">
-        <div style="font-size:14px;font-weight:700;color:var(--text-primary);margin-bottom:10px;">
-            🎯 What you can ask — by voice or text:
-        </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-            <span class="stat-pill" style="background:rgba(37,99,235,0.08);color:#2563EB;border:1px solid rgba(37,99,235,0.2);">District-level risk analysis</span>
-            <span class="stat-pill" style="background:rgba(5,150,105,0.08);color:#059669;border:1px solid rgba(5,150,105,0.2);">Category contamination trends</span>
-            <span class="stat-pill" style="background:rgba(225,29,72,0.08);color:#E11D48;border:1px solid rgba(225,29,72,0.2);">Emergency action plans</span>
-            <span class="stat-pill" style="background:rgba(124,58,237,0.08);color:#7C3AED;border:1px solid rgba(124,58,237,0.2);">Health correlation insights</span>
-            <span class="stat-pill" style="background:rgba(217,119,6,0.08);color:#D97706;border:1px solid rgba(217,119,6,0.2);">Seasonal risk forecasting</span>
-            <span class="stat-pill" style="background:rgba(8,145,178,0.08);color:#0891B2;border:1px solid rgba(8,145,178,0.2);">Inspection resource allocation</span>
-            <span class="stat-pill" style="background:rgba(249,115,22,0.08);color:#F97316;border:1px solid rgba(249,115,22,0.2);">🎤 Speak any of the above</span>
-        </div>
-        <div style="margin-top:12px;padding:10px 14px;background:rgba(37,99,235,0.05);
-                    border:1px solid rgba(37,99,235,0.15);border-radius:10px;
-                    font-size:12px;color:#64748B;line-height:1.6;">
-            🎙️ <b style='color:var(--text-primary);'>Voice tip:</b>
-            Click <b>🎤 Record</b>, speak your question clearly, then click <b>⏹ Done</b>.
-            Groq Whisper will transcribe it and the AI will respond automatically.
-            Supports English, Telugu (<code>te</code>), and Hindi (<code>hi</code>)
-            — change the <code>language</code> param in <code>transcribe_voice()</code>.
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
 
 
 # =========================================================
 # 🔮 PREDICTIVE ANALYTICS
 # =========================================================
 
-with tab_predict:
-    st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);margin-bottom:6px;">🔮 Predictive Analytics</div>
-    <div style="color:#64748B;font-size:14px;margin-bottom:22px;">Groq AI-generated risk forecasts, trend projections, and scenario analysis for the next quarter</div>""", unsafe_allow_html=True)
+if tab_predict is not None:
+    with tab_predict:
+        st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);margin-bottom:6px;">🔮 Predictive Analytics</div>
+        <div style="color:#64748B;font-size:14px;margin-bottom:22px;">Groq AI-generated risk forecasts, trend projections, and scenario analysis for the next quarter</div>""", unsafe_allow_html=True)
 
-    p1, p2, p3, p4 = st.columns(4)
-    with p1: st.markdown(kpi("📈","Projected Risk",     "+18%",   "Next quarter estimate",        "down", "kpi-red"),    unsafe_allow_html=True)
-    with p2: st.markdown(kpi("🎯","Forecast Accuracy",  "94%",    "Historical model precision",   "up",   "kpi-green"),  unsafe_allow_html=True)
-    with p3: st.markdown(kpi("⚡","Risk Districts",     "7",      "Projected high-risk zones",    "warn", "kpi-amber"),  unsafe_allow_html=True)
-    with p4: st.markdown(kpi("🔮","Horizon",            "Q3 2025","Next forecast period",         "up",   "kpi-purple"), unsafe_allow_html=True)
+        p1, p2, p3, p4 = st.columns(4)
+        with p1: st.markdown(kpi("📈","Projected Risk",     "+18%",   "Next quarter estimate",        "down", "kpi-red"),    unsafe_allow_html=True)
+        with p2: st.markdown(kpi("🎯","Forecast Accuracy",  "94%",    "Historical model precision",   "up",   "kpi-green"),  unsafe_allow_html=True)
+        with p3: st.markdown(kpi("⚡","Risk Districts",     "7",      "Projected high-risk zones",    "warn", "kpi-amber"),  unsafe_allow_html=True)
+        with p4: st.markdown(kpi("🔮","Horizon",            "Q3 2025","Next forecast period",         "up",   "kpi-purple"), unsafe_allow_html=True)
 
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
-    forecast_col, chart_col = st.columns([1, 2])
-    with forecast_col:
-        st.markdown("""<div class="forecast-card">
-            <div style="font-size:16px;font-weight:700;color:var(--text-primary);margin-bottom:14px;">⚡ Groq AI Forecast Narrative</div>""", unsafe_allow_html=True)
+        forecast_col, chart_col = st.columns([1, 2])
+        with forecast_col:
+            st.markdown("""<div class="forecast-card">
+                <div style="font-size:16px;font-weight:700;color:var(--text-primary);margin-bottom:14px;">⚡ Groq AI Forecast Narrative</div>""", unsafe_allow_html=True)
 
-        if st.button("🔮 Generate AI Forecast", use_container_width=True):
-            dist_summary = (
-                f"Districts: Tirupati (89% risk), Chittoor (76%), Vizag (72%), Kurnool (68%). "
-                f"Adulteration rate: {adulteration}%. Top risk categories: Milk, Oils, Spices."
-            )
-            with st.spinner("⚡ Groq AI generating forecast..."):
-                try:
-                    forecast_text_result = get_ai_forecast(dist_summary)
-                    st.session_state["forecast_text"] = forecast_text_result
-                except Exception as e:
-                    st.session_state["forecast_text"] = f"Forecast unavailable: {str(e)}"
+            if st.button("🔮 Generate AI Forecast", use_container_width=True, key="gen_forecast_btn"):
+                dist_summary = (
+                    f"Districts: Tirupati (89% risk), Chittoor (76%), Vizag (72%), Kurnool (68%). "
+                    f"Adulteration rate: {adulteration}%. Top risk categories: Milk, Oils, Spices."
+                )
+                with st.spinner("⚡ Groq AI generating forecast..."):
+                    try:
+                        forecast_text_result = get_ai_forecast(dist_summary)
+                        st.session_state["forecast_text"] = forecast_text_result
+                    except Exception as e:
+                        st.session_state["forecast_text"] = f"Forecast unavailable: {str(e)}"
 
-        if "forecast_text" in st.session_state:
-            st.markdown(f"""
-            <div style="background:rgba(124,58,237,0.05);border-radius:12px;padding:16px;
-                        font-size:14px;color:var(--text-dim);line-height:1.7;margin-top:12px;
-                        border:1px solid rgba(124,58,237,0.12);">
-                {safe(st.session_state["forecast_text"])}
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown("""
-            <div style="background:rgba(124,58,237,0.05);border-radius:12px;padding:16px;
-                        font-size:14px;color:#94A3B8;line-height:1.7;margin-top:12px;font-style:italic;">
-                Click "Generate AI Forecast" to get a personalized risk projection powered by Groq AI.
-            </div>
-            """, unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+            if "forecast_text" in st.session_state:
+                st.markdown(f"""
+                <div style="background:rgba(124,58,237,0.05);border-radius:12px;padding:16px;
+                            font-size:14px;color:var(--text-dim);line-height:1.7;margin-top:12px;
+                            border:1px solid rgba(124,58,237,0.12);">
+                    {safe(st.session_state["forecast_text"])}
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div style="background:rgba(124,58,237,0.05);border-radius:12px;padding:16px;
+                            font-size:14px;color:#94A3B8;line-height:1.7;margin-top:12px;font-style:italic;">
+                    Click "Generate AI Forecast" to get a personalized risk projection powered by Groq AI.
+                </div>
+                """, unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
 
-    with chart_col:
-        months_past   = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug"]
-        months_future = ["Sep","Oct","Nov","Dec","Jan'26","Feb'26"]
-        risk_past     = [45, 52, 48, 61, 70, 65, 72, 68]
-        risk_forecast = [72, 76, 80, 85, 88, 82]
-        risk_upper    = [78, 84, 90, 95, 96, 92]
-        risk_lower    = [65, 68, 70, 74, 78, 71]
+        with chart_col:
+            months_past   = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug"]
+            months_future = ["Sep","Oct","Nov","Dec","Jan'26","Feb'26"]
+            risk_past     = [45, 52, 48, 61, 70, 65, 72, 68]
+            risk_forecast = [72, 76, 80, 85, 88, 82]
+            risk_upper    = [78, 84, 90, 95, 96, 92]
+            risk_lower    = [65, 68, 70, 74, 78, 71]
 
-        fig_forecast = go.Figure()
-        fig_forecast.add_trace(go.Scatter(x=months_past, y=risk_past, name="Historical", mode="lines+markers",
-                                           line=dict(color="#2563EB", width=2.5), marker=dict(size=6)))
-        fig_forecast.add_trace(go.Scatter(x=months_future, y=risk_forecast, name="AI Forecast", mode="lines+markers",
-                                           line=dict(color="#E11D48", width=2.5, dash="dash"), marker=dict(size=6)))
-        fig_forecast.add_trace(go.Scatter(
-            x=months_future + months_future[::-1],
-            y=risk_upper + risk_lower[::-1],
-            fill="toself", fillcolor="rgba(225,29,72,0.08)",
-            line=dict(color="rgba(255,255,255,0)"), name="Confidence Band"
-        ))
-        fig_forecast.add_vline(x=7.5, line_dash="dot", line_color="#D97706", line_width=1.5,
-                                annotation_text="Forecast →", annotation_font_color="#D97706")
-        fig_forecast.update_layout(**get_chart_layout(), height=360, title_text="Risk Score — Historical + Groq AI Forecast")
-        st.plotly_chart(fig_forecast, use_container_width=True)
+            fig_forecast = go.Figure()
+            fig_forecast.add_trace(go.Scatter(x=months_past, y=risk_past, name="Historical", mode="lines+markers",
+                                               line=dict(color="#2563EB", width=2.5), marker=dict(size=6)))
+            fig_forecast.add_trace(go.Scatter(x=months_future, y=risk_forecast, name="AI Forecast", mode="lines+markers",
+                                               line=dict(color="#E11D48", width=2.5, dash="dash"), marker=dict(size=6)))
+            fig_forecast.add_trace(go.Scatter(
+                x=months_future + months_future[::-1],
+                y=risk_upper + risk_lower[::-1],
+                fill="toself", fillcolor="rgba(225,29,72,0.08)",
+                line=dict(color="rgba(255,255,255,0)"), name="Confidence Band"
+            ))
+            fig_forecast.add_vline(x=7.5, line_dash="dot", line_color="#D97706", line_width=1.5,
+                                    annotation_text="Forecast →", annotation_font_color="#D97706")
+            fig_forecast.update_layout(**get_chart_layout(), height=360, title_text="Risk Score — Historical + Groq AI Forecast")
+            st.plotly_chart(fig_forecast, use_container_width=True)
 
-    cat_forecast = pd.DataFrame({
-        "Category":    ["Milk","Oils","Spices","Water","Street Food","Fruits","Vegetables","Sweets"],
-        "Current Risk":[95, 88, 72, 75, 60, 45, 38, 55],
-        "Projected Q3":[108, 98, 80, 82, 65, 48, 35, 62],
-        "Change":      ["+13.7%","+11.4%","+11.1%","+9.3%","+8.3%","+6.7%","-7.9%","+12.7%"]
-    })
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-    st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;color:var(--text-primary);margin-bottom:12px;">📊 Category Risk Projection — Q3 2025</div>""", unsafe_allow_html=True)
+        cat_forecast = pd.DataFrame({
+            "Category":    ["Milk","Oils","Spices","Water","Street Food","Fruits","Vegetables","Sweets"],
+            "Current Risk":[95, 88, 72, 75, 60, 45, 38, 55],
+            "Projected Q3":[108, 98, 80, 82, 65, 48, 35, 62],
+            "Change":      ["+13.7%","+11.4%","+11.1%","+9.3%","+8.3%","+6.7%","-7.9%","+12.7%"]
+        })
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;color:var(--text-primary);margin-bottom:12px;">📊 Category Risk Projection — Q3 2025</div>""", unsafe_allow_html=True)
 
-    fig_cat_proj = go.Figure()
-    fig_cat_proj.add_trace(go.Bar(name="Current Risk", x=cat_forecast["Category"], y=cat_forecast["Current Risk"],
-                                   marker_color="#2563EB", marker_line_width=0))
-    fig_cat_proj.add_trace(go.Bar(name="Projected Q3", x=cat_forecast["Category"], y=cat_forecast["Projected Q3"],
-                                   marker_color="#E11D48", marker_line_width=0, opacity=0.8))
-    fig_cat_proj.update_layout(**get_chart_layout(), height=360, title_text="Current vs Projected Risk by Category", barmode="group")
-    st.plotly_chart(fig_cat_proj, use_container_width=True)
+        fig_cat_proj = go.Figure()
+        fig_cat_proj.add_trace(go.Bar(name="Current Risk", x=cat_forecast["Category"], y=cat_forecast["Current Risk"],
+                                       marker_color="#2563EB", marker_line_width=0))
+        fig_cat_proj.add_trace(go.Bar(name="Projected Q3", x=cat_forecast["Category"], y=cat_forecast["Projected Q3"],
+                                       marker_color="#E11D48", marker_line_width=0, opacity=0.8))
+        fig_cat_proj.update_layout(**get_chart_layout(), height=360, title_text="Current vs Projected Risk by Category", barmode="group")
+        st.plotly_chart(fig_cat_proj, use_container_width=True)
 
-    st.dataframe(cat_forecast.style.applymap(
-        lambda v: "color: #E11D48; font-weight: bold;" if isinstance(v, str) and v.startswith("+") else
-                  "color: #059669; font-weight: bold;" if isinstance(v, str) and v.startswith("-") else "",
-        subset=["Change"]
-    ), use_container_width=True)
+        st.dataframe(cat_forecast.style.applymap(
+            lambda v: "color: #E11D48; font-weight: bold;" if isinstance(v, str) and v.startswith("+") else
+                      "color: #059669; font-weight: bold;" if isinstance(v, str) and v.startswith("-") else "",
+            subset=["Change"]
+        ), use_container_width=True)
 
-    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-    st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;color:var(--text-primary);margin-bottom:12px;">🎭 Scenario Modeling</div>""", unsafe_allow_html=True)
-    sc1, sc2, sc3 = st.columns(3)
-    scenarios = [
-        ("🟢 Best Case",  "#059669", "rgba(5,150,105,0.08)",  "rgba(5,150,105,0.2)",
-         "Inspections surge +40%, proactive vendor training, cold chain compliance enforced.",
-         "Projected adulteration: 15%", "Health cases: -22%", "Risk districts: 2"),
-        ("🟡 Base Case",  "#D97706", "rgba(217,119,6,0.08)",  "rgba(217,119,6,0.2)",
-         "Current intervention pace maintained, seasonal risks not mitigated.",
-         "Projected adulteration: 24%", "Health cases: +8%",  "Risk districts: 5"),
-        ("🔴 Worst Case", "#E11D48", "rgba(225,29,72,0.08)",  "rgba(225,29,72,0.2)",
-         "Inspections reduce, festival season surge, water contamination spreads.",
-         "Projected adulteration: 38%", "Health cases: +35%", "Risk districts: 10"),
-    ]
-    for col, (title, color, bg, border, desc, s1, s2, s3_val) in zip([sc1, sc2, sc3], scenarios):
-        with col:
-            st.markdown(f"""
-            <div style="background:{bg};border:1px solid {border};border-radius:16px;padding:20px;height:100%;">
-                <div style="font-size:15px;font-weight:700;color:{color};margin-bottom:10px;">{title}</div>
-                <div style="font-size:13px;color:#475569;line-height:1.7;margin-bottom:14px;">{desc}</div>
-                <div style="font-size:12px;font-weight:600;color:{color};">{s1}</div>
-                <div style="font-size:12px;font-weight:600;color:{color};">{s2}</div>
-                <div style="font-size:12px;font-weight:600;color:{color};">{s3_val}</div>
-            </div>
-            """, unsafe_allow_html=True)
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+        st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;color:var(--text-primary);margin-bottom:12px;">🎭 Scenario Modeling</div>""", unsafe_allow_html=True)
+        sc1, sc2, sc3 = st.columns(3)
+        scenarios = [
+            ("🟢 Best Case",  "#059669", "rgba(5,150,105,0.08)",  "rgba(5,150,105,0.2)",
+             "Inspections surge +40%, proactive vendor training, cold chain compliance enforced.",
+             "Projected adulteration: 15%", "Health cases: -22%", "Risk districts: 2"),
+            ("🟡 Base Case",  "#D97706", "rgba(217,119,6,0.08)",  "rgba(217,119,6,0.2)",
+             "Current intervention pace maintained, seasonal risks not mitigated.",
+             "Projected adulteration: 24%", "Health cases: +8%",  "Risk districts: 5"),
+            ("🔴 Worst Case", "#E11D48", "rgba(225,29,72,0.08)",  "rgba(225,29,72,0.2)",
+             "Inspections reduce, festival season surge, water contamination spreads.",
+             "Projected adulteration: 38%", "Health cases: +35%", "Risk districts: 10"),
+        ]
+        for col, (title, color, bg, border, desc, s1, s2, s3_val) in zip([sc1, sc2, sc3], scenarios):
+            with col:
+                st.markdown(f"""
+                <div style="background:{bg};border:1px solid {border};border-radius:16px;padding:20px;height:100%;">
+                    <div style="font-size:15px;font-weight:700;color:{color};margin-bottom:10px;">{title}</div>
+                    <div style="font-size:13px;color:#475569;line-height:1.7;margin-bottom:14px;">{desc}</div>
+                    <div style="font-size:12px;font-weight:600;color:{color};">{s1}</div>
+                    <div style="font-size:12px;font-weight:600;color:{color};">{s2}</div>
+                    <div style="font-size:12px;font-weight:600;color:{color};">{s3_val}</div>
+                </div>
+                """, unsafe_allow_html=True)
 
 
 # =========================================================
 # ABOUT
 # =========================================================
 
-with tab6:
-    st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);margin-bottom:6px;">ℹ️ About VigilantAP</div>
-    <div style="color:#64748B;font-size:14px;margin-bottom:22px;">Platform overview, technology stack, objectives, and future roadmap</div>""", unsafe_allow_html=True)
+if tab6 is not None:
+    with tab6:
+        st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:800;color:var(--text-primary);margin-bottom:6px;">ℹ️ About VigilantAP</div>
+        <div style="color:#64748B;font-size:14px;margin-bottom:22px;">Platform overview, technology stack, objectives, and future roadmap</div>""", unsafe_allow_html=True)
 
-    ab1, ab2, ab3, ab4 = st.columns(4)
-    with ab1: st.markdown(kpi("🗺️","Districts Covered", "26",      "Andhra Pradesh",         "up", "kpi-blue"),  unsafe_allow_html=True)
-    with ab2: st.markdown(kpi("🧪","Samples Tested",    "20,000+", "Comprehensive testing",  "up", "kpi-cyan"),  unsafe_allow_html=True)
-    with ab3: st.markdown(kpi("🍔","Risk Categories",   "16",      "Food types monitored",   "up", "kpi-purple"),unsafe_allow_html=True)
-    with ab4: st.markdown(kpi("✅","System Accuracy",   "98%",     "Monitoring precision",   "up", "kpi-green"),  unsafe_allow_html=True)
+        ab1, ab2, ab3, ab4 = st.columns(4)
+        with ab1: st.markdown(kpi("🗺️","Districts Covered", "26",      "Andhra Pradesh",         "up", "kpi-blue"),  unsafe_allow_html=True)
+        with ab2: st.markdown(kpi("🧪","Samples Tested",    "20,000+", "Comprehensive testing",  "up", "kpi-cyan"),  unsafe_allow_html=True)
+        with ab3: st.markdown(kpi("🍔","Risk Categories",   "16",      "Food types monitored",   "up", "kpi-purple"),unsafe_allow_html=True)
+        with ab4: st.markdown(kpi("✅","System Accuracy",   "98%",     "Monitoring precision",   "up", "kpi-green"),  unsafe_allow_html=True)
 
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-    st.markdown("""<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:18px;padding:32px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,0.05);">
-        <div style="font-family:'Space Grotesk',sans-serif;font-size:22px;font-weight:700;color:var(--text-primary);margin-bottom:14px;">📌 What is VigilantAP?</div>
-        <div style="font-size:15px;color:#475569;line-height:1.9;">
-            VigilantAP is an AI-powered food safety intelligence platform designed to monitor food adulteration trends, identify high-risk districts, analyze public health impact, and support government intervention decisions across <b style='color:#2563EB;'>Andhra Pradesh</b>. Built on real laboratory testing data, the platform enables proactive, evidence-based public health management. Powered by <b style='color:#F97316;'>Groq · LLaMA-3 70B</b> for ultra-fast AI responses, <b style='color:#0891B2;'>predictive analytics</b>, <b style='color:#E11D48;'>anomaly detection</b>, and <b style='color:#059669;'>dark mode</b>.
-        </div>
-    </div>""", unsafe_allow_html=True)
-
-    ab_c1, ab_c2 = st.columns(2)
-    with ab_c1:
-        tech_items = ["Python","Streamlit","Plotly","Pandas","NumPy","Groq AI","LLaMA-3 70B","Anomaly Detection","Predictive Analytics","Dark Mode"]
-        tech_colors_map = {
-            "Python":"#2563EB","Streamlit":"#E11D48","Plotly":"#7C3AED","Pandas":"#059669",
-            "NumPy":"#0891B2","Groq AI":"#F97316","LLaMA-3 70B":"#FB923C",
-            "Anomaly Detection":"#4F46E5","Predictive Analytics":"#0E7490","Dark Mode":"#475569"
-        }
-        tech_pills = "".join([
-            f'<span style="background:rgba(0,0,0,0.04);border:1px solid rgba(0,0,0,0.1);color:{tech_colors_map[t]};border-radius:20px;padding:5px 14px;font-size:13px;font-weight:600;">{t}</span>'
-            for t in tech_items
-        ])
-        st.markdown(f"""<div style="background:var(--bg-card);border:1px solid rgba(37,99,235,0.12);border-radius:16px;padding:24px;height:100%;">
-            <div style="font-size:16px;font-weight:700;color:var(--text-primary);margin-bottom:14px;">🛠️ Technologies Used</div>
-            <div style="display:flex;flex-wrap:wrap;gap:8px;">{tech_pills}</div>
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        st.markdown("""<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:18px;padding:32px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,0.05);">
+            <div style="font-family:'Space Grotesk',sans-serif;font-size:22px;font-weight:700;color:var(--text-primary);margin-bottom:14px;">📌 What is VigilantAP?</div>
+            <div style="font-size:15px;color:#475569;line-height:1.9;">
+                VigilantAP is an AI-powered food safety intelligence platform designed to monitor food adulteration trends, identify high-risk districts, analyze public health impact, and support government intervention decisions across <b style='color:#2563EB;'>Andhra Pradesh</b>. Built on real laboratory testing data, the platform enables proactive, evidence-based public health management. Powered by <b style='color:#F97316;'>Groq · LLaMA-3 70B</b> for ultra-fast AI responses, <b style='color:#0891B2;'>predictive analytics</b>, <b style='color:#E11D48;'>anomaly detection</b>, and <b style='color:#059669;'>dark mode</b>.
+            </div>
         </div>""", unsafe_allow_html=True)
 
-    with ab_c2:
-        st.markdown("""<div style="background:var(--bg-card);border:1px solid rgba(5,150,105,0.12);border-radius:16px;padding:24px;height:100%;">
-            <div style="font-size:16px;font-weight:700;color:var(--text-primary);margin-bottom:14px;">🎯 Project Objectives</div>
-            <ul style="font-size:14px;color:#475569;line-height:2.1;margin:0;padding-left:18px;">
-                <li>Monitor food adulteration trends across AP</li>
-                <li>Identify high-risk districts in real-time</li>
-                <li>Analyze and visualize public health impact</li>
-                <li>Support data-driven government decisions</li>
-                <li>Groq AI chat assistant for instant insights</li>
-                <li>Predictive risk forecasting with scenario modeling</li>
-                <li>Statistical anomaly detection across districts</li>
-            </ul>
-        </div>""", unsafe_allow_html=True)
+        ab_c1, ab_c2 = st.columns(2)
+        with ab_c1:
+            tech_items = ["Python","Streamlit","Plotly","Pandas","NumPy","Groq AI","LLaMA-3 70B","Anomaly Detection","Predictive Analytics","Dark Mode"]
+            tech_colors_map = {
+                "Python":"#2563EB","Streamlit":"#E11D48","Plotly":"#7C3AED","Pandas":"#059669",
+                "NumPy":"#0891B2","Groq AI":"#F97316","LLaMA-3 70B":"#FB923C",
+                "Anomaly Detection":"#4F46E5","Predictive Analytics":"#0E7490","Dark Mode":"#475569"
+            }
+            tech_pills = "".join([
+                f'<span style="background:rgba(0,0,0,0.04);border:1px solid rgba(0,0,0,0.1);color:{tech_colors_map[t]};border-radius:20px;padding:5px 14px;font-size:13px;font-weight:600;">{t}</span>'
+                for t in tech_items
+            ])
+            st.markdown(f"""<div style="background:var(--bg-card);border:1px solid rgba(37,99,235,0.12);border-radius:16px;padding:24px;height:100%;">
+                <div style="font-size:16px;font-weight:700;color:var(--text-primary);margin-bottom:14px;">🛠️ Technologies Used</div>
+                <div style="display:flex;flex-wrap:wrap;gap:8px;">{tech_pills}</div>
+            </div>""", unsafe_allow_html=True)
+
+        with ab_c2:
+            st.markdown("""<div style="background:var(--bg-card);border:1px solid rgba(5,150,105,0.12);border-radius:16px;padding:24px;height:100%;">
+                <div style="font-size:16px;font-weight:700;color:var(--text-primary);margin-bottom:14px;">🎯 Project Objectives</div>
+                <ul style="font-size:14px;color:#475569;line-height:2.1;margin:0;padding-left:18px;">
+                    <li>Monitor food adulteration trends across AP</li>
+                    <li>Identify high-risk districts in real-time</li>
+                    <li>Analyze and visualize public health impact</li>
+                    <li>Support data-driven government decisions</li>
+                    <li>Groq AI chat assistant for instant insights</li>
+                    <li>Predictive risk forecasting with scenario modeling</li>
+                    <li>Statistical anomaly detection across districts</li>
+                </ul>
+            </div>""", unsafe_allow_html=True)
 
 
-    # ---- END USERS SECTION ----
-    st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
-    st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;color:var(--text-primary);margin-bottom:16px;">👥 Who Uses VigilantAP?</div>""", unsafe_allow_html=True)
+        # ---- END USERS SECTION ----
+        st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
+        st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;color:var(--text-primary);margin-bottom:16px;">👥 Who Uses VigilantAP?</div>""", unsafe_allow_html=True)
 
-    end_users = [
-        {
-            "icon": "🏛️",
-            "title": "Government Officials",
-            "role": "Food Safety Department · AP",
-            "desc": "Policy makers and senior officials who rely on real-time dashboards and AI-driven forecasts to allocate inspection resources, frame food safety regulations, and track district-level compliance.",
-            "tags": ["Policy Decisions", "Budget Allocation", "Compliance Tracking"],
-            "color": "#2563EB",
-            "bg": "rgba(37,99,235,0.07)",
-            "border": "rgba(37,99,235,0.18)",
-        },
-        {
-            "icon": "🔬",
-            "title": "Food Safety Inspectors",
-            "role": "Field Officers · District Labs",
-            "desc": "Ground-level officers and laboratory analysts who use anomaly alerts, sample test results, and risk heatmaps to prioritise field visits and flag high-risk vendors faster.",
-            "tags": ["Anomaly Alerts", "Lab Results", "Risk Heatmaps"],
-            "color": "#0891B2",
-            "bg": "rgba(8,145,178,0.07)",
-            "border": "rgba(8,145,178,0.18)",
-        },
-        {
-            "icon": "🏥",
-            "title": "Public Health Officials",
-            "role": "Health Departments · Hospitals",
-            "desc": "Epidemiologists and health administrators who correlate food adulteration spikes with disease outbreak data to identify causation patterns and coordinate early health interventions.",
-            "tags": ["Outbreak Correlation", "Health Impact", "Early Warning"],
-            "color": "#7C3AED",
-            "bg": "rgba(124,58,237,0.07)",
-            "border": "rgba(124,58,237,0.18)",
-        },
-        {
-            "icon": "📊",
-            "title": "Data Analysts & Researchers",
-            "role": "Academic Institutions · Think Tanks",
-            "desc": "Researchers who leverage predictive analytics, scenario modeling, and historical trend data to publish studies, build machine-learning models, and propose evidence-based food safety reforms.",
-            "tags": ["Predictive Models", "Trend Analysis", "Research Data"],
-            "color": "#059669",
-            "bg": "rgba(5,150,105,0.07)",
-            "border": "rgba(5,150,105,0.18)",
-        },
-        {
-            "icon": "📰",
-            "title": "Journalists & Media",
-            "role": "Investigative Reporters · Press",
-            "desc": "Reporters using transparent district-level statistics, adulteration category breakdowns, and AI-generated insights to craft data-driven public interest stories on food safety.",
-            "tags": ["District Stats", "Category Breakdown", "Public Reporting"],
-            "color": "#D97706",
-            "bg": "rgba(217,119,6,0.07)",
-            "border": "rgba(217,119,6,0.18)",
-        },
-        {
-            "icon": "🛒",
-            "title": "Consumer Advocacy Groups",
-            "role": "NGOs · Consumer Forums",
-            "desc": "Civil society organisations that monitor platform data to hold vendors and authorities accountable, raise public awareness about high-risk food categories, and advocate for stricter standards.",
-            "tags": ["Accountability", "Awareness Campaigns", "Advocacy"],
-            "color": "#E11D48",
-            "bg": "rgba(225,29,72,0.07)",
-            "border": "rgba(225,29,72,0.18)",
-        },
-    ]
+        end_users = [
+            {
+                "icon": "🏛️",
+                "title": "Government Officials",
+                "role": "Food Safety Department · AP",
+                "desc": "Policy makers and senior officials who rely on real-time dashboards and AI-driven forecasts to allocate inspection resources, frame food safety regulations, and track district-level compliance.",
+                "tags": ["Policy Decisions", "Budget Allocation", "Compliance Tracking"],
+                "color": "#2563EB",
+                "bg": "rgba(37,99,235,0.07)",
+                "border": "rgba(37,99,235,0.18)",
+            },
+            {
+                "icon": "🔬",
+                "title": "Food Safety Inspectors",
+                "role": "Field Officers · District Labs",
+                "desc": "Ground-level officers and laboratory analysts who use anomaly alerts, sample test results, and risk heatmaps to prioritise field visits and flag high-risk vendors faster.",
+                "tags": ["Anomaly Alerts", "Lab Results", "Risk Heatmaps"],
+                "color": "#0891B2",
+                "bg": "rgba(8,145,178,0.07)",
+                "border": "rgba(8,145,178,0.18)",
+            },
+            {
+                "icon": "🏥",
+                "title": "Public Health Officials",
+                "role": "Health Departments · Hospitals",
+                "desc": "Epidemiologists and health administrators who correlate food adulteration spikes with disease outbreak data to identify causation patterns and coordinate early health interventions.",
+                "tags": ["Outbreak Correlation", "Health Impact", "Early Warning"],
+                "color": "#7C3AED",
+                "bg": "rgba(124,58,237,0.07)",
+                "border": "rgba(124,58,237,0.18)",
+            },
+            {
+                "icon": "📊",
+                "title": "Data Analysts & Researchers",
+                "role": "Academic Institutions · Think Tanks",
+                "desc": "Researchers who leverage predictive analytics, scenario modeling, and historical trend data to publish studies, build machine-learning models, and propose evidence-based food safety reforms.",
+                "tags": ["Predictive Models", "Trend Analysis", "Research Data"],
+                "color": "#059669",
+                "bg": "rgba(5,150,105,0.07)",
+                "border": "rgba(5,150,105,0.18)",
+            },
+            {
+                "icon": "📰",
+                "title": "Journalists & Media",
+                "role": "Investigative Reporters · Press",
+                "desc": "Reporters using transparent district-level statistics, adulteration category breakdowns, and AI-generated insights to craft data-driven public interest stories on food safety.",
+                "tags": ["District Stats", "Category Breakdown", "Public Reporting"],
+                "color": "#D97706",
+                "bg": "rgba(217,119,6,0.07)",
+                "border": "rgba(217,119,6,0.18)",
+            },
+            {
+                "icon": "🛒",
+                "title": "Consumer Advocacy Groups",
+                "role": "NGOs · Consumer Forums",
+                "desc": "Civil society organisations that monitor platform data to hold vendors and authorities accountable, raise public awareness about high-risk food categories, and advocate for stricter standards.",
+                "tags": ["Accountability", "Awareness Campaigns", "Advocacy"],
+                "color": "#E11D48",
+                "bg": "rgba(225,29,72,0.07)",
+                "border": "rgba(225,29,72,0.18)",
+            },
+        ]
 
-    eu_row1 = st.columns(3)
-    eu_row2 = st.columns(3)
-    all_eu_cols = eu_row1 + eu_row2
+        eu_row1 = st.columns(3)
+        eu_row2 = st.columns(3)
+        all_eu_cols = eu_row1 + eu_row2
 
-    for col, user in zip(all_eu_cols, end_users):
-        tags_html = "".join([
-            f'<span style="background:rgba(0,0,0,0.05);border:1px solid {user["border"]};color:{user["color"]};'
-            f'border-radius:20px;padding:3px 11px;font-size:11px;font-weight:700;letter-spacing:0.3px;">{t}</span>'
-            for t in user["tags"]
-        ])
-        with col:
-            st.markdown(f"""
-            <div style="background:{user['bg']};border:1px solid {user['border']};border-radius:18px;
-                        padding:22px;height:100%;transition:transform 0.2s ease;margin-bottom:16px;">
-                <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
-                    <div style="width:46px;height:46px;border-radius:12px;background:rgba(255,255,255,0.6);
-                                border:1px solid {user['border']};display:flex;align-items:center;
-                                justify-content:center;font-size:22px;flex-shrink:0;">
-                        {user['icon']}
+        for col, user in zip(all_eu_cols, end_users):
+            tags_html = "".join([
+                f'<span style="background:rgba(0,0,0,0.05);border:1px solid {user["border"]};color:{user["color"]};'
+                f'border-radius:20px;padding:3px 11px;font-size:11px;font-weight:700;letter-spacing:0.3px;">{t}</span>'
+                for t in user["tags"]
+            ])
+            with col:
+                st.markdown(f"""
+                <div style="background:{user['bg']};border:1px solid {user['border']};border-radius:18px;
+                            padding:22px;height:100%;transition:transform 0.2s ease;margin-bottom:16px;">
+                    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
+                        <div style="width:46px;height:46px;border-radius:12px;background:rgba(255,255,255,0.6);
+                                    border:1px solid {user['border']};display:flex;align-items:center;
+                                    justify-content:center;font-size:22px;flex-shrink:0;">
+                            {user['icon']}
+                        </div>
+                        <div>
+                            <div style="font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:700;
+                                        color:var(--text-primary);line-height:1.3;">{user['title']}</div>
+                            <div style="font-size:11px;color:{user['color']};font-weight:600;
+                                        text-transform:uppercase;letter-spacing:0.5px;margin-top:2px;">{user['role']}</div>
+                        </div>
+                    </div>
+                    <div style="font-size:13px;color:#475569;line-height:1.75;margin-bottom:14px;">{user['desc']}</div>
+                    <div style="display:flex;flex-wrap:wrap;gap:6px;">{tags_html}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+        # ---- DEVELOPED BY SOCIAL TEK ----
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;color:var(--text-primary);margin-bottom:16px;">🏢 Developed By</div>""", unsafe_allow_html=True)
+
+        dev_col1, dev_col2 = st.columns([1.1, 0.9])
+
+        with dev_col1:
+            components.html("""
+            <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+            <div style="background:#ffffff;border:1px solid rgba(37,99,235,0.18);border-radius:18px;padding:28px;font-family:'DM Sans',sans-serif;">
+                <div style="display:flex;align-items:center;gap:14px;margin-bottom:18px;">
+                    <div style="width:52px;height:52px;border-radius:14px;
+                                background:linear-gradient(135deg,#2563EB,#0891B2);
+                                display:flex;align-items:center;justify-content:center;
+                                font-size:26px;flex-shrink:0;box-shadow:0 6px 18px rgba(37,99,235,0.35);">
+                        🤖
                     </div>
                     <div>
-                        <div style="font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:700;
-                                    color:var(--text-primary);line-height:1.3;">{user['title']}</div>
-                        <div style="font-size:11px;color:{user['color']};font-weight:600;
-                                    text-transform:uppercase;letter-spacing:0.5px;margin-top:2px;">{user['role']}</div>
+                        <div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:800;
+                                    color:#0F172A;line-height:1.2;">Social Tek</div>
+                        <div style="font-size:12px;color:#2563EB;font-weight:600;letter-spacing:0.4px;margin-top:3px;">
+                            SocialTek AI &amp; ML Business Solutions
+                        </div>
                     </div>
                 </div>
-                <div style="font-size:13px;color:#475569;line-height:1.75;margin-bottom:14px;">{user['desc']}</div>
-                <div style="display:flex;flex-wrap:wrap;gap:6px;">{tags_html}</div>
+
+                <div style="font-size:14px;color:#475569;line-height:1.85;margin-bottom:18px;">
+                    VigilantAP is proudly developed and maintained by <b style="color:#2563EB;">Social Tek</b> —
+                    a Hyderabad-based AI &amp; ML solutions company specialising in intelligent data platforms,
+                    predictive analytics, and government technology solutions.
+                </div>
+
+                <div style="display:flex;flex-direction:column;gap:12px;">
+
+                    <div style="display:flex;align-items:flex-start;gap:10px;">
+                        <div style="width:34px;height:34px;border-radius:8px;background:rgba(37,99,235,0.09);
+                                    border:1px solid rgba(37,99,235,0.2);display:flex;align-items:center;
+                                    justify-content:center;font-size:16px;flex-shrink:0;margin-top:2px;">📍</div>
+                        <div>
+                            <div style="font-size:11px;color:#94A3B8;font-weight:700;text-transform:uppercase;
+                                        letter-spacing:0.6px;margin-bottom:3px;">Registered Office</div>
+                            <div style="font-size:13px;color:#0F172A;font-weight:500;line-height:1.7;">
+                                501, Sathyabama Complex, Bhagyanagar Colony,<br>
+                                Opp. Sai Baba Temple, KPHB,<br>
+                                Hyderabad, Telangana &ndash; 500085
+                            </div>
+                        </div>
+                    </div>
+
+                    <div style="display:flex;align-items:flex-start;gap:10px;">
+                        <div style="width:34px;height:34px;border-radius:8px;background:rgba(8,145,178,0.09);
+                                    border:1px solid rgba(8,145,178,0.2);display:flex;align-items:center;
+                                    justify-content:center;font-size:16px;flex-shrink:0;margin-top:2px;">🏛️</div>
+                        <div>
+                            <div style="font-size:11px;color:#94A3B8;font-weight:700;text-transform:uppercase;
+                                        letter-spacing:0.6px;margin-bottom:3px;">Corporate Office</div>
+                            <div style="font-size:13px;color:#0F172A;font-weight:500;line-height:1.7;">
+                                508, Manjeera Majestic Commercial,<br>
+                                JNTU Road, KPHB,<br>
+                                Hyderabad, Telangana &ndash; 500085
+                            </div>
+                        </div>
+                    </div>
+
+                    <div style="display:flex;align-items:center;gap:10px;margin-top:2px;">
+                        <div style="width:34px;height:34px;border-radius:8px;background:rgba(5,150,105,0.09);
+                                    border:1px solid rgba(5,150,105,0.2);display:flex;align-items:center;
+                                    justify-content:center;font-size:16px;flex-shrink:0;">🌐</div>
+                        <div style="font-size:13px;color:#059669;font-weight:600;">KPHB, Hyderabad, Telangana, India</div>
+                    </div>
+
+                </div>
+            </div>
+            """, height=370, scrolling=False)
+
+        with dev_col2:
+            st.markdown("""<div style="font-size:13px;font-weight:700;color:var(--text-primary);margin-bottom:8px;">
+                📍 Office Location — KPHB, Hyderabad
+            </div>""", unsafe_allow_html=True)
+
+            # Interactive map centred on KPHB, Hyderabad
+            # Registered office: Sathyabama Complex (~17.4612, 78.3768)
+            # Corporate office:   Manjeera Majestic  (~17.4587, 78.3812)
+            office_map_data = pd.DataFrame({
+                "lat":   [17.4612, 17.4587],
+                "lon":   [78.3768, 78.3812],
+                "name":  ["Registered Office – Sathyabama Complex, KPHB",
+                          "Corporate Office – Manjeera Majestic Commercial, KPHB"],
+                "color": ["#2563EB", "#0891B2"],
+                "size":  [18, 18],
+            })
+
+            fig_office = px.scatter_mapbox(
+                office_map_data,
+                lat="lat", lon="lon",
+                hover_name="name",
+                color="name",
+                color_discrete_sequence=["#2563EB", "#0891B2"],
+                size="size",
+                size_max=18,
+                zoom=14.5,
+                height=370,
+            )
+            fig_office.update_layout(
+                mapbox_style="carto-positron",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin={"r": 0, "t": 0, "l": 0, "b": 0},
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom", y=1.01,
+                    xanchor="left", x=0,
+                    font=dict(size=11),
+                    bgcolor="rgba(255,255,255,0.85)",
+                    bordercolor="rgba(0,0,0,0.08)",
+                    borderwidth=1,
+                ),
+            )
+            st.plotly_chart(fig_office, use_container_width=True)
+
+            st.markdown("""
+            <div style="display:flex;gap:10px;margin-top:4px;flex-wrap:wrap;">
+                <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:#475569;">
+                    <span style="width:10px;height:10px;border-radius:50%;background:#2563EB;display:inline-block;"></span>
+                    Sathyabama Complex (Reg. Office)
+                </div>
+                <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:#475569;">
+                    <span style="width:10px;height:10px;border-radius:50%;background:#0891B2;display:inline-block;"></span>
+                    Manjeera Majestic (Corp. Office)
+                </div>
             </div>
             """, unsafe_allow_html=True)
 
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
-    # ---- DEVELOPED BY SOCIAL TEK ----
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-    st.markdown("""<div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;color:var(--text-primary);margin-bottom:16px;">🏢 Developed By</div>""", unsafe_allow_html=True)
-
-    dev_col1, dev_col2 = st.columns([1.1, 0.9])
-
-    with dev_col1:
-        components.html("""
-        <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700;800&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-        <div style="background:#ffffff;border:1px solid rgba(37,99,235,0.18);border-radius:18px;padding:28px;font-family:'DM Sans',sans-serif;">
-            <div style="display:flex;align-items:center;gap:14px;margin-bottom:18px;">
-                <div style="width:52px;height:52px;border-radius:14px;
-                            background:linear-gradient(135deg,#2563EB,#0891B2);
-                            display:flex;align-items:center;justify-content:center;
-                            font-size:26px;flex-shrink:0;box-shadow:0 6px 18px rgba(37,99,235,0.35);">
-                    🤖
-                </div>
-                <div>
-                    <div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:800;
-                                color:#0F172A;line-height:1.2;">Social Tek</div>
-                    <div style="font-size:12px;color:#2563EB;font-weight:600;letter-spacing:0.4px;margin-top:3px;">
-                        SocialTek AI &amp; ML Business Solutions
-                    </div>
-                </div>
+        # ---- FOOTER ----
+        st.markdown("""<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:16px;padding:24px;text-align:center;margin-top:10px;">
+            <div style="font-size:14px;color:#64748B;">
+                <b style='color:var(--text-primary);'>VigilantAP v2.2</b> — Food Safety Intelligence Platform<br>
+                Domain: Public Health Monitoring &nbsp;|&nbsp; Stack: Python · Streamlit · Plotly · Groq AI · LLaMA-3 70B<br>
+                Developed by <b style='color:#2563EB;'>Social Tek (SocialTek AI &amp; ML Business Solutions)</b> · KPHB, Hyderabad<br>
+                <span style="color:#2563EB;">© 2026 VigilantAP. Built for Andhra Pradesh Food Safety Department.</span>
             </div>
-
-            <div style="font-size:14px;color:#475569;line-height:1.85;margin-bottom:18px;">
-                VigilantAP is proudly developed and maintained by <b style="color:#2563EB;">Social Tek</b> —
-                a Hyderabad-based AI &amp; ML solutions company specialising in intelligent data platforms,
-                predictive analytics, and government technology solutions.
-            </div>
-
-            <div style="display:flex;flex-direction:column;gap:12px;">
-
-                <div style="display:flex;align-items:flex-start;gap:10px;">
-                    <div style="width:34px;height:34px;border-radius:8px;background:rgba(37,99,235,0.09);
-                                border:1px solid rgba(37,99,235,0.2);display:flex;align-items:center;
-                                justify-content:center;font-size:16px;flex-shrink:0;margin-top:2px;">📍</div>
-                    <div>
-                        <div style="font-size:11px;color:#94A3B8;font-weight:700;text-transform:uppercase;
-                                    letter-spacing:0.6px;margin-bottom:3px;">Registered Office</div>
-                        <div style="font-size:13px;color:#0F172A;font-weight:500;line-height:1.7;">
-                            501, Sathyabama Complex, Bhagyanagar Colony,<br>
-                            Opp. Sai Baba Temple, KPHB,<br>
-                            Hyderabad, Telangana &ndash; 500085
-                        </div>
-                    </div>
-                </div>
-
-                <div style="display:flex;align-items:flex-start;gap:10px;">
-                    <div style="width:34px;height:34px;border-radius:8px;background:rgba(8,145,178,0.09);
-                                border:1px solid rgba(8,145,178,0.2);display:flex;align-items:center;
-                                justify-content:center;font-size:16px;flex-shrink:0;margin-top:2px;">🏛️</div>
-                    <div>
-                        <div style="font-size:11px;color:#94A3B8;font-weight:700;text-transform:uppercase;
-                                    letter-spacing:0.6px;margin-bottom:3px;">Corporate Office</div>
-                        <div style="font-size:13px;color:#0F172A;font-weight:500;line-height:1.7;">
-                            508, Manjeera Majestic Commercial,<br>
-                            JNTU Road, KPHB,<br>
-                            Hyderabad, Telangana &ndash; 500085
-                        </div>
-                    </div>
-                </div>
-
-                <div style="display:flex;align-items:center;gap:10px;margin-top:2px;">
-                    <div style="width:34px;height:34px;border-radius:8px;background:rgba(5,150,105,0.09);
-                                border:1px solid rgba(5,150,105,0.2);display:flex;align-items:center;
-                                justify-content:center;font-size:16px;flex-shrink:0;">🌐</div>
-                    <div style="font-size:13px;color:#059669;font-weight:600;">KPHB, Hyderabad, Telangana, India</div>
-                </div>
-
-            </div>
-        </div>
-        """, height=370, scrolling=False)
-
-    with dev_col2:
-        st.markdown("""<div style="font-size:13px;font-weight:700;color:var(--text-primary);margin-bottom:8px;">
-            📍 Office Location — KPHB, Hyderabad
         </div>""", unsafe_allow_html=True)
 
-        # Interactive map centred on KPHB, Hyderabad
-        # Registered office: Sathyabama Complex (~17.4612, 78.3768)
-        # Corporate office:   Manjeera Majestic  (~17.4587, 78.3812)
-        office_map_data = pd.DataFrame({
-            "lat":   [17.4612, 17.4587],
-            "lon":   [78.3768, 78.3812],
-            "name":  ["Registered Office – Sathyabama Complex, KPHB",
-                      "Corporate Office – Manjeera Majestic Commercial, KPHB"],
-            "color": ["#2563EB", "#0891B2"],
-            "size":  [18, 18],
-        })
+# =========================================================
+# AI TAB GUARD — tabs are hidden from non-subscribers above,
+# this is a safety net in case of direct access attempts
+# =========================================================
+# (No action needed — tabs simply don't exist for non-subscribers)
 
-        fig_office = px.scatter_mapbox(
-            office_map_data,
-            lat="lat", lon="lon",
-            hover_name="name",
-            color="name",
-            color_discrete_sequence=["#2563EB", "#0891B2"],
-            size="size",
-            size_max=18,
-            zoom=14.5,
-            height=370,
-        )
-        fig_office.update_layout(
-            mapbox_style="carto-positron",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            margin={"r": 0, "t": 0, "l": 0, "b": 0},
-            legend=dict(
-                orientation="h",
-                yanchor="bottom", y=1.01,
-                xanchor="left", x=0,
-                font=dict(size=11),
-                bgcolor="rgba(255,255,255,0.85)",
-                bordercolor="rgba(0,0,0,0.08)",
-                borderwidth=1,
-            ),
-        )
-        st.plotly_chart(fig_office, use_container_width=True)
 
+# =========================================================
+# ADMIN DASHBOARD TAB
+# =========================================================
+
+if is_admin() and tab_admin is not None:
+    with tab_admin:
         st.markdown("""
-        <div style="display:flex;gap:10px;margin-top:4px;flex-wrap:wrap;">
-            <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:#475569;">
-                <span style="width:10px;height:10px;border-radius:50%;background:#2563EB;display:inline-block;"></span>
-                Sathyabama Complex (Reg. Office)
-            </div>
-            <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:#475569;">
-                <span style="width:10px;height:10px;border-radius:50%;background:#0891B2;display:inline-block;"></span>
-                Manjeera Majestic (Corp. Office)
-            </div>
+        <div style="font-family:'Space Grotesk',sans-serif;font-size:30px;font-weight:900;
+                    background:linear-gradient(135deg,#7C3AED,#2563EB);
+                    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+                    margin-bottom:6px;">🛠️ Admin Dashboard</div>
+        <div style="color:#64748B;font-size:14px;margin-bottom:22px;">
+            User management, system metrics, and platform oversight
         </div>
         """, unsafe_allow_html=True)
 
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        # ---- KPI Row ----
+        _all_users  = {k:v for k,v in USERS_DB.items() if v['role'] != 'admin'}
+        total_users      = len(_all_users)
+        org_count        = sum(1 for u in _all_users.values() if u['role'] == 'org')
+        subscribed_count = sum(1 for u in _all_users.values() if u['subscribed'] and u['role'] == 'user')
+        free_count       = sum(1 for u in _all_users.values() if not u['subscribed'])
 
-    # ---- FOOTER ----
-    st.markdown("""<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:16px;padding:24px;text-align:center;margin-top:10px;">
-        <div style="font-size:14px;color:#64748B;">
-            <b style='color:var(--text-primary);'>VigilantAP v2.2</b> — Food Safety Intelligence Platform<br>
-            Domain: Public Health Monitoring &nbsp;|&nbsp; Stack: Python · Streamlit · Plotly · Groq AI · LLaMA-3 70B<br>
-            Developed by <b style='color:#2563EB;'>Social Tek (SocialTek AI &amp; ML Business Solutions)</b> · KPHB, Hyderabad<br>
-            <span style="color:#2563EB;">© 2026 VigilantAP. Built for Andhra Pradesh Food Safety Department.</span>
+        ak1, ak2, ak3, ak4 = st.columns(4)
+        with ak1: st.markdown(kpi("👥","Total Users",        total_users,      "Excl. platform admin",      "up",   "kpi-blue"),   unsafe_allow_html=True)
+        with ak2: st.markdown(kpi("🏢","Organisations",      org_count,        "Enterprise subscribers",    "up",   "kpi-purple"), unsafe_allow_html=True)
+        with ak3: st.markdown(kpi("⚡","Pro Subscribers",    subscribed_count, "Individual paid users",     "up",   "kpi-green"),  unsafe_allow_html=True)
+        with ak4: st.markdown(kpi("🔓","Free Tier",          free_count,       "No subscription",           "warn", "kpi-amber"),  unsafe_allow_html=True)
+
+        st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
+
+        # ---- User Table ----
+        st.markdown("""
+        <div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;
+                    color:var(--text-primary);margin-bottom:14px;">👥 User Management</div>
+        """, unsafe_allow_html=True)
+
+        for uname, udata in USERS_DB.items():
+            if udata['role'] == 'admin': continue  # skip platform admin row
+            plan_c = PLANS.get(udata['plan'], {}).get('color', '#64748B')
+            plan_i = PLANS.get(udata['plan'], {}).get('icon', '🔓')
+            sub_badge = (
+                f'<span style="background:rgba(5,150,105,0.10);color:#059669;border:1px solid rgba(5,150,105,0.25);'
+                f'border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;">✅ Active</span>'
+                if udata['subscribed'] else
+                f'<span style="background:rgba(217,119,6,0.10);color:#D97706;border:1px solid rgba(217,119,6,0.25);'
+                f'border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;">🔒 Free</span>'
+            )
+            if udata['role'] == 'admin':
+                role_badge = '<span style="background:rgba(124,58,237,0.10);color:#7C3AED;border:1px solid rgba(124,58,237,0.25);border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;">👑 Admin</span>'
+            elif udata['role'] == 'org':
+                role_badge = '<span style="background:rgba(8,145,178,0.10);color:#0891B2;border:1px solid rgba(8,145,178,0.25);border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;">🏢 Organisation</span>'
+            else:
+                role_badge = '<span style="background:rgba(37,99,235,0.08);color:#2563EB;border:1px solid rgba(37,99,235,0.2);border-radius:20px;padding:3px 10px;font-size:11px;font-weight:700;">👤 User</span>'
+            st.markdown(f"""
+            <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:16px;
+                        padding:18px 22px;margin-bottom:10px;display:flex;align-items:center;
+                        gap:18px;flex-wrap:wrap;">
+                <div style="width:44px;height:44px;border-radius:12px;
+                            background:linear-gradient(135deg,#2563EB,#0891B2);
+                            display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;">
+                    {'👑' if udata['role']=='admin' else ('🏢' if udata['role']=='org' else '👤')}
+                </div>
+                <div style="flex:1;min-width:160px;">
+                    <div style="font-weight:700;color:var(--text-primary);font-size:15px;">{udata['name']}</div>
+                    <div style="color:#64748B;font-size:13px;">@{uname} · {udata['email']}</div>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+                    <span style="background:{plan_c}18;color:{plan_c};border:1px solid {plan_c}30;
+                                 border-radius:20px;padding:3px 12px;font-size:12px;font-weight:700;">
+                        {plan_i} {udata['plan']}
+                    </span>
+                    {sub_badge}
+                    {role_badge}
+                </div>
+                <div style="color:#94A3B8;font-size:12px;white-space:nowrap;">Joined {udata['joined']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+
+        # ---- System Health ----
+        st.markdown("""
+        <div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;
+                    color:var(--text-primary);margin-bottom:14px;">⚙️ System Health</div>
+        """, unsafe_allow_html=True)
+
+        sh1, sh2, sh3 = st.columns(3)
+        metrics_data = [
+            (sh1, "🟢", "API Status",        "Groq API", "Operational",  "#059669"),
+            (sh2, "🟢", "Data Pipeline",     "CSV feeds", "Live",         "#2563EB"),
+            (sh3, "🟡", "Model Latency",     "Avg response", "~1.2s",     "#D97706"),
+        ]
+        for col, dot, label, sub, val, col_c in metrics_data:
+            with col:
+                st.markdown(f"""
+                <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:16px;
+                            padding:22px;text-align:center;">
+                    <div style="font-size:30px;margin-bottom:8px;">{dot}</div>
+                    <div style="font-weight:700;color:var(--text-primary);font-size:15px;">{label}</div>
+                    <div style="color:#94A3B8;font-size:12px;margin-bottom:6px;">{sub}</div>
+                    <div style="font-weight:800;color:{col_c};font-size:18px;">{val}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+
+        # ---- Subscription management form ----
+        st.markdown("""
+        <div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;
+                    color:var(--text-primary);margin-bottom:14px;">🔧 Manage User Subscription</div>
+        """, unsafe_allow_html=True)
+
+        with st.form("admin_sub_form"):
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
+                target_user = st.selectbox("Select User", [u for u in USERS_DB if u != "admin"])
+            with sc2:
+                new_plan = st.selectbox("New Plan", ["Free", "Pro", "Enterprise"])
+            with sc3:
+                new_sub  = st.selectbox("Subscription Status", ["Active (subscribed)", "Free (not subscribed)"])
+            submitted = st.form_submit_button("✅ Update Subscription", use_container_width=True)
+            if submitted:
+                st.session_state.USERS_DB[target_user]['plan']       = new_plan
+                st.session_state.USERS_DB[target_user]['subscribed'] = (new_sub == "Active (subscribed)")
+                USERS_DB = st.session_state.USERS_DB  # refresh alias
+                st.success(f"✅ Updated {target_user}: {new_plan} plan, subscribed={st.session_state.USERS_DB[target_user]['subscribed']}")
+                st.rerun()
+
+
+# =========================================================
+# REVENUE DASHBOARD TAB
+# =========================================================
+
+if is_admin() and tab_revenue is not None:
+    with tab_revenue:
+        st.markdown("""
+        <div style="font-family:'Space Grotesk',sans-serif;font-size:30px;font-weight:900;
+                    background:linear-gradient(135deg,#059669,#0891B2);
+                    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+                    margin-bottom:6px;">💰 Revenue Dashboard</div>
+        <div style="color:#64748B;font-size:14px;margin-bottom:22px;">
+            Subscription revenue, plan distribution, and billing overview
         </div>
-    </div>""", unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
+
+        # ---- Revenue calculations (admin excluded — not a paying account) ----
+        plan_counts = {}
+        for u in USERS_DB.values():
+            if u['subscribed'] and u['role'] != 'admin':
+                plan_counts[u['plan']] = plan_counts.get(u['plan'], 0) + 1
+
+        monthly_revenue = sum(PLANS[p]['price'] * c for p, c in plan_counts.items())
+        annual_revenue  = monthly_revenue * 12
+        total_paid_users = sum(plan_counts.values())
+        
+
+        rk1, rk2, rk3, rk4 = st.columns(4)
+        with rk1: st.markdown(kpi("💰","Monthly Revenue",   f"₹{monthly_revenue:,}",  "Current MRR",            "up", "kpi-green"),  unsafe_allow_html=True)
+        with rk2: st.markdown(kpi("📈","Annual Revenue",    f"₹{annual_revenue:,}",   "ARR (projected)",        "up", "kpi-blue"),   unsafe_allow_html=True)
+        with rk3: st.markdown(kpi("👥","Paying Users",      total_paid_users,          "Active subscriptions",   "up", "kpi-teal"),   unsafe_allow_html=True)
+       
+
+        st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
+
+        rev_col1, rev_col2 = st.columns([1.2, 1])
+
+        with rev_col1:
+            # Monthly revenue bar chart (simulated 6-month history)
+            import random
+            random.seed(42)
+            months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun"]
+            rev_hist = [monthly_revenue * (0.6 + 0.08*i + random.uniform(-0.05,0.05)) for i in range(6)]
+            rev_hist[-1] = monthly_revenue  # current month is accurate
+
+            fig_rev = go.Figure()
+            fig_rev.add_trace(go.Bar(
+                x=months, y=rev_hist,
+                marker=dict(
+                    color=rev_hist,
+                    colorscale=[[0,"#0891B2"],[1,"#059669"]],
+                    line=dict(width=0),
+                ),
+                text=[f"₹{int(v):,}" for v in rev_hist],
+                textposition="outside",
+                textfont=dict(size=12, color="#475569"),
+            ))
+            _rev_layout = get_chart_layout()
+            _rev_layout['yaxis'] = dict(
+                tickprefix="₹", tickformat=",",
+                gridcolor=_rev_layout.get('yaxis', {}).get('gridcolor', 'rgba(0,0,0,0.05)'),
+                linecolor=_rev_layout.get('yaxis', {}).get('linecolor', 'rgba(0,0,0,0.08)'),
+                tickfont=dict(color="#64748B", size=12),
+            )
+            fig_rev.update_layout(
+                **_rev_layout,
+                title="Monthly Revenue (₹)",
+                height=320,
+                showlegend=False,
+            )
+            st.plotly_chart(fig_rev, use_container_width=True)
+
+        with rev_col2:
+            # Plan distribution donut
+            if plan_counts:
+                plan_names = list(plan_counts.keys())
+                plan_vals  = list(plan_counts.values())
+                plan_cols  = [PLANS[p]['color'] for p in plan_names]
+
+                fig_donut = go.Figure(go.Pie(
+                    labels=plan_names,
+                    values=plan_vals,
+                    hole=0.62,
+                    marker=dict(colors=plan_cols, line=dict(width=0)),
+                    textinfo="label+percent",
+                    textfont=dict(size=13),
+                ))
+                fig_donut.update_layout(
+                    **get_chart_layout(),
+                    title="Subscription Plan Mix",
+                    height=320,
+                    showlegend=True,
+                )
+                st.plotly_chart(fig_donut, use_container_width=True)
+
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+
+        # ---- Billing table ----
+        st.markdown("""
+        <div style="font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;
+                    color:var(--text-primary);margin-bottom:14px;">🧾 Billing Overview</div>
+        """, unsafe_allow_html=True)
+
+        billing_rows = []
+        for uname, udata in USERS_DB.items():
+            if udata['subscribed'] and udata['role'] != 'admin':
+                billing_rows.append({
+                    "User":    udata['name'],
+                    "Username": uname,
+                    "Plan":    udata['plan'],
+                    "Monthly (₹)": PLANS[udata['plan']]['price'],
+                    "Annual (₹)":  PLANS[udata['plan']]['price'] * 12,
+                    "Status":  "✅ Active",
+                    "Joined":  udata['joined'],
+                })
+
+        if billing_rows:
+            billing_df = pd.DataFrame(billing_rows)
+            st.dataframe(billing_df, use_container_width=True, hide_index=True)
+
+            # Totals row
+            total_monthly = sum(r["Monthly (₹)"] for r in billing_rows)
+            total_annual  = sum(r["Annual (₹)"]  for r in billing_rows)
+            st.markdown(f"""
+            <div style="background:linear-gradient(135deg,rgba(5,150,105,0.08),rgba(8,145,178,0.06));
+                        border:1px solid rgba(5,150,105,0.2);border-radius:16px;padding:18px 24px;
+                        display:flex;gap:32px;flex-wrap:wrap;margin-top:10px;">
+                <div>
+                    <div style="font-size:11px;color:#94A3B8;text-transform:uppercase;letter-spacing:0.6px;">Total MRR</div>
+                    <div style="font-size:24px;font-weight:800;color:#059669;">₹{total_monthly:,}</div>
+                </div>
+                <div>
+                    <div style="font-size:11px;color:#94A3B8;text-transform:uppercase;letter-spacing:0.6px;">Total ARR</div>
+                    <div style="font-size:24px;font-weight:800;color:#0891B2;">₹{total_annual:,}</div>
+                </div>
+                <div>
+                    <div style="font-size:11px;color:#94A3B8;text-transform:uppercase;letter-spacing:0.6px;">Paying Subscribers</div>
+                    <div style="font-size:24px;font-weight:800;color:#2563EB;">{len(billing_rows)}</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.info("No active subscriptions found.")
